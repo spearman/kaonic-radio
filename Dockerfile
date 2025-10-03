@@ -24,16 +24,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /opt/
 
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+
 # Download latest Yocto SDK
-# RUN set -e && DOWNLOAD_URL=$(curl -s https://api.github.com/repos/BeechatNetworkSystemsLtd/kaonic-yocto/releases/latest \
-#     | grep "browser_download_url" \
-#     | grep "${SDK_ASSET_NAME}" \
-#     | cut -d '"' -f 4) \
-#     && wget "$DOWNLOAD_URL" -O /opt/yocto-sdk.sh
+RUN set -e && DOWNLOAD_URL=$(curl -s https://api.github.com/repos/BeechatNetworkSystemsLtd/kaonic-yocto/releases/latest \
+    | grep "browser_download_url" \
+    | grep "${SDK_ASSET_NAME}" \
+    | cut -d '"' -f 4) \
+    && wget "$DOWNLOAD_URL" -O /opt/yocto-sdk.sh
 
 # Install yocoto sdk
-# RUN chmod +x /opt/yocto-sdk.sh \
-#     && /opt/yocto-sdk.sh -y -d /opt/yocto-sdk
+RUN chmod +x /opt/yocto-sdk.sh \
+    && /opt/yocto-sdk.sh -y -d /opt/yocto-sdk
 
 CMD ["/bin/bash"]
-
