@@ -1,12 +1,14 @@
-use crate::baseband::{Baseband, BasebandFrame};
+use crate::baseband::{Baseband, BasebandAutoMode, BasebandFrame};
 use crate::bus::Bus;
 use crate::error::RadioError;
-use crate::modulation::{self, Modulation};
+use crate::modulation::{self};
 use crate::radio::{
-    Band, FrequencySampleRate, Radio, RadioChannel, RadioFrequency, RadioFrequencyConfig,
-    RadioState, RadioTransreceiverConfig, ReceiverBandwidth, RelativeCutOff, TransmitterCutOff,
+    Band, Radio, RadioChannel, RadioFrequency, RadioFrequencyConfig, RadioState,
+    RadioTransreceiverConfig,
 };
-use crate::regs::{self, BasebandInterruptMask, RadioInterruptMask, RegisterAddress};
+use crate::regs::{
+    self, BasebandInterrupt, BasebandInterruptMask, RadioInterruptMask, RegisterAddress,
+};
 
 pub struct Band09;
 pub struct Band24;
@@ -41,24 +43,31 @@ pub struct Transreceiver<B: Band, I: Bus + Clone> {
     baseband: Baseband<B, I>,
 }
 
+const CHANGE_STATE_DURATION: core::time::Duration = core::time::Duration::from_millis(500);
+
 impl<B: Band, I: Bus + Clone> Transreceiver<B, I> {
     pub(crate) fn new(bus: I) -> Self {
-        let mut trx = Self {
+        let trx = Self {
             radio: Radio::<B, I>::new(bus.clone()),
             baseband: Baseband::<B, I>::new(bus.clone()),
         };
-
-        trx.disable_irqs().unwrap();
 
         trx
     }
 
     pub fn set_frequency(&mut self, config: &RadioFrequencyConfig) -> Result<(), RadioError> {
         self.radio
-            .change_state(core::time::Duration::from_millis(100), RadioState::TrxOff)?;
+            .change_state(CHANGE_STATE_DURATION, RadioState::TrxOff)?;
+
         self.radio.set_frequency(config)?;
 
+        self.radio.receive()?;
+
         Ok(())
+    }
+
+    pub const fn check_band(&self, freq: RadioFrequency) -> bool {
+        Radio::<B, I>::check_band(freq)
     }
 
     pub fn setup_irq(
@@ -88,9 +97,9 @@ impl<B: Band, I: Bus + Clone> Transreceiver<B, I> {
         Ok((rf_irqs, bb_irqs))
     }
 
-    pub fn baseband_transmit(&mut self, frame: &BasebandFrame) -> Result<(), RadioError> {
+    pub fn bb_transmit(&mut self, frame: &BasebandFrame) -> Result<(), RadioError> {
         self.radio
-            .change_state(core::time::Duration::from_millis(500), RadioState::TrxPrep)?;
+            .change_state(CHANGE_STATE_DURATION, RadioState::TrxPrep)?;
 
         self.baseband.load_tx(frame)?;
 
@@ -99,26 +108,121 @@ impl<B: Band, I: Bus + Clone> Transreceiver<B, I> {
         Ok(())
     }
 
-    pub fn baseband_receive(&mut self, frame: &mut BasebandFrame) -> Result<(), RadioError> {
-        self.baseband.load_rx(frame)?;
+    pub fn measure_ed(&mut self) -> Result<i8, RadioError> {
+        self.radio
+            .set_ed_mode(crate::radio::EnergyDetectionMode::Single)?;
+
+        if let Some(_) = self.radio.wait_irq(
+            RadioInterruptMask::new()
+                .add_irq(regs::RadioInterrupt::EnergyDetectionCompletion)
+                .build(),
+            core::time::Duration::from_millis(100),
+        ) {
+            self.radio.read_edv()
+        } else {
+            Err(RadioError::Timeout)
+        }
+    }
+
+    pub fn bb_transmit_cca(&mut self, frame: &BasebandFrame) -> Result<(), RadioError> {
+        // NOTE: 6.15.5 Clear Channel Assessment with Automatic Transmit (CCATX)
+
+        // NOTE: It is recommended disabling the baseband (set PC.BBEN to 0) to avoid that the
+        // baseband decodes/receives any frame during the ED measurement.
+        self.baseband.disable()?;
+
+        self.baseband.load_tx(frame)?;
+
+        self.radio
+            .change_state(CHANGE_STATE_DURATION, RadioState::Rx)?;
+
+        // NOTE: Do not use procedure CCATX together with procedure Transmit and Switch to Receive (TX2RX)
+        self.baseband.set_auto_mode(BasebandAutoMode {
+            cca_tx: true,
+            auto_rx: false,
+            ..Default::default()
+        })?;
+
+        // TODO: provide EDT value in params
+        self.baseband.set_auto_edt(-50)?;
+
+        self.radio.clear_irqs()?;
+
+        self.radio
+            .set_ed_mode(crate::radio::EnergyDetectionMode::Single)?;
+
+        if let Some(irqs) = self.radio.wait_any_irq(
+            RadioInterruptMask::new()
+                .add_irq(regs::RadioInterrupt::TransceiverReady)
+                .add_irq(regs::RadioInterrupt::TransceiverError)
+                .build(),
+            core::time::Duration::from_millis(100),
+        ) {
+            if irqs.has_irq(regs::RadioInterrupt::TransceiverError) {
+                // NOTE: If the baseband has been disabled for the measurement period and the
+                // channel has assessed as busy, the baseband needs to be enabled again by setting
+                // PC.BBEN to 1.
+                self.baseband.enable()?;
+                return Err(RadioError::Timeout);
+            }
+        }
+
+        self.radio.receive()?;
+
         Ok(())
     }
 
-    pub fn configure(&mut self, modulation: &modulation::Modulation) -> Result<(), RadioError> {
+    pub fn bb_receive(
+        &mut self,
+        frame: &mut BasebandFrame,
+        timeout: core::time::Duration,
+    ) -> Result<(), RadioError> {
+        self.radio.receive()?;
+
+        if self
+            .baseband
+            .wait_irq(BasebandInterrupt::ReceiverFrameEnd, timeout)
+        {
+            self.baseband.load_rx(frame)?;
+            Ok(())
+        } else {
+            Err(RadioError::Timeout)
+        }
+    }
+
+    pub fn start_receive(&mut self) -> Result<(), RadioError> {
+        self.radio.receive()
+    }
+
+    pub fn configure(
+        &mut self,
+        modulation: &modulation::Modulation,
+        trx_config: &RadioTransreceiverConfig,
+    ) -> Result<(), RadioError> {
+        self.radio
+            .change_state(CHANGE_STATE_DURATION, RadioState::TrxOff)?;
+
         self.baseband.disable()?;
+
+        self.radio.configure_transreceiver(&trx_config)?;
 
         self.baseband.configure(modulation)?;
 
-        self.radio
-            .configure_transreceiver(&TransreceiverConfigurator::configure(&modulation))?;
-
         self.baseband.enable()?;
+
+        self.radio.update_frequency()?;
+
+        self.radio.receive()?;
 
         Ok(())
     }
 
     pub fn reset(&mut self) -> Result<(), RadioError> {
-        self.radio.reset()
+        self.radio.reset()?;
+
+        self.disable_irqs()?;
+
+        Ok(())
     }
 
     pub fn radio(&mut self) -> &mut Radio<B, I> {
@@ -127,69 +231,5 @@ impl<B: Band, I: Bus + Clone> Transreceiver<B, I> {
 
     pub fn baseband(&mut self) -> &mut Baseband<B, I> {
         &mut self.baseband
-    }
-}
-
-struct TransreceiverConfigurator<B: Band> {
-    _band: core::marker::PhantomData<B>,
-}
-
-impl TransreceiverConfigurator<Band09> {
-    pub fn configure(modulation: &Modulation) -> RadioTransreceiverConfig {
-        let mut trx_config = RadioTransreceiverConfig::default();
-        let tx_config = &mut trx_config.tx_config;
-        let rx_config = &mut trx_config.rx_config;
-
-        match modulation {
-            Modulation::Ofdm(ofdm) => {
-                // Table 6-90. Recommended Transmitter Frontend Configuration
-                // Table 6-93. Recommended PHY Receiver and Digital Frontend Configuration
-                match ofdm.opt {
-                    modulation::OfdmBandwidthOption::Option1 => {
-                        tx_config.sr = FrequencySampleRate::SampleRate1333kHz;
-                        tx_config.rcut = RelativeCutOff::Fcut1_000;
-                        tx_config.lpfcut = TransmitterCutOff::Flc800kHz;
-
-                        rx_config.rcut = RelativeCutOff::Fcut1_000;
-                        rx_config.bw = ReceiverBandwidth::Bw1250kHzIf2000kHz;
-                        rx_config.if_shift = true;
-                    }
-                    modulation::OfdmBandwidthOption::Option2 => {
-                        tx_config.sr = FrequencySampleRate::SampleRate1333kHz;
-                        tx_config.rcut = RelativeCutOff::Fcut0_750;
-                        tx_config.lpfcut = TransmitterCutOff::Flc500kHz;
-
-                        rx_config.rcut = RelativeCutOff::Fcut0_500;
-                        rx_config.bw = ReceiverBandwidth::Bw800kHzIf1000kHz;
-                        rx_config.if_shift = true;
-                    }
-                    modulation::OfdmBandwidthOption::Option3 => {
-                        tx_config.sr = FrequencySampleRate::SampleRate666kHz;
-                        tx_config.rcut = RelativeCutOff::Fcut0_750;
-                        tx_config.lpfcut = TransmitterCutOff::Flc250kHz;
-
-                        rx_config.rcut = RelativeCutOff::Fcut0_500;
-                        rx_config.bw = ReceiverBandwidth::Bw400kHzIf500kHz;
-                        rx_config.if_shift = false;
-                    }
-                    modulation::OfdmBandwidthOption::Option4 => {
-                        tx_config.sr = FrequencySampleRate::SampleRate666kHz;
-                        tx_config.rcut = RelativeCutOff::Fcut0_500;
-                        tx_config.lpfcut = TransmitterCutOff::Flc160kHz;
-
-                        rx_config.rcut = RelativeCutOff::Fcut0_375;
-                        rx_config.bw = ReceiverBandwidth::Bw250kHzIf250kHz;
-                        rx_config.if_shift = true;
-                    }
-                };
-
-                rx_config.sr = tx_config.sr;
-            }
-            _ => {}
-        }
-
-        trx_config.tx_config.power = 10;
-
-        return trx_config;
     }
 }

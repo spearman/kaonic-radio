@@ -1,23 +1,30 @@
 [package]
 name = "kaonic-commd"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+rust-version = "1.75"
 
 [dependencies]
 
 # Kaonic
 radio-rf215 = { path="../radio-rf215/" }
 kaonic-radio = { path="../kaonic-radio/" }
+kaonic-net = { path="../kaonic-net/" }
+kaonic-qos = { path="../kaonic-qos/" }
 
 # Logging
-simple_logger = "5.0.0"
+simple_logger = "=5.0.0"
 log = "0.4"
 
 # Protobuf and gRPC
 tonic = "0.13.0"
 prost = "0.13.5"
-tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "signal"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
+
+# Additional dependencies
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
 
 [build-dependencies]
 tonic-build = "0.13.0"

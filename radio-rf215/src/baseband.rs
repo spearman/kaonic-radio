@@ -4,7 +4,7 @@ use crate::{
     bus::Bus,
     error::RadioError,
     frame::Frame,
-    modulation::{Modulation, OfdmModulation},
+    modulation::{Modulation, OfdmModulation, QpskModulation},
     radio::Band,
     regs::{self, BasebandInterrupt, BasebandInterruptMask, RegisterAddress, RG_BBCX_FRAME_SIZE},
 };
@@ -12,9 +12,32 @@ use crate::{
 pub type BasebandFrame = Frame<RG_BBCX_FRAME_SIZE>;
 
 pub struct BasebandControl {
-    pub enabled: bool,
     pub continuous_tx: bool,
     pub fcs_filter: bool,
+}
+
+pub struct BasebandAutoMode {
+    pub auto_ack_tx: bool,  // AMCS.AACKFT
+    pub auto_ack_fcs: bool, // AMCS.AACKFA
+    pub auto_ack_dr: bool,  // AMCS.AACKDR
+    pub auto_ack_src: bool, // AMCS.AACKS
+    pub auto_ack_en: bool,  // AMCS.AACK
+    pub cca_tx: bool,       // AMCS.CCATX
+    pub auto_rx: bool,      // AMCS.TX2RX
+}
+
+impl Default for BasebandAutoMode {
+    fn default() -> Self {
+        Self {
+            auto_ack_tx: false,
+            auto_ack_fcs: false,
+            auto_ack_dr: false,
+            auto_ack_src: false,
+            auto_ack_en: false,
+            cca_tx: false,
+            auto_rx: false,
+        }
+    }
 }
 
 pub struct Baseband<B, I>
@@ -62,6 +85,52 @@ where
         Ok(frame)
     }
 
+    pub fn set_auto_mode(&mut self, mode: BasebandAutoMode) -> Result<(), RadioError> {
+        let mut amcs = 0u8;
+
+        if mode.auto_ack_tx {
+            amcs = amcs | 0b1000_0000;
+        }
+
+        if mode.auto_ack_fcs {
+            amcs = amcs | 0b0100_0000;
+        }
+
+        if mode.auto_ack_dr {
+            amcs = amcs | 0b0010_0000;
+        }
+
+        if mode.auto_ack_src {
+            amcs = amcs | 0b0001_0000;
+        }
+
+        if mode.auto_ack_en {
+            amcs = amcs | 0b0000_1000;
+        }
+
+        if mode.cca_tx {
+            amcs = amcs | 0b0000_0010;
+        }
+
+        if mode.auto_rx {
+            amcs = amcs | 0b0000_0001;
+        }
+
+        self.bus
+            .write_reg_u8(Self::abs_reg(regs::RG_BBCX_AMCS), amcs)?;
+
+        Ok(())
+    }
+
+    pub fn set_auto_edt(&mut self, threshold: i8) -> Result<(), RadioError> {
+        let amedt: u8 = threshold as u8;
+
+        self.bus
+            .write_reg_u8(Self::abs_reg(regs::RG_BBCX_AMEDT), amedt)?;
+
+        Ok(())
+    }
+
     pub fn load_tx(&mut self, frame: &BasebandFrame) -> Result<(), RadioError> {
         self.load_tx_data(frame.as_slice())
     }
@@ -84,7 +153,7 @@ where
             Modulation::Off => 0x00,
             Modulation::Fsk => 0x01,
             Modulation::Ofdm(_) => 0x02,
-            Modulation::Qpsk => 0x03,
+            Modulation::Qpsk(_) => 0x03,
         };
 
         // Update baseband phy type
@@ -98,8 +167,24 @@ where
         match modulation {
             Modulation::Off => Ok(()),
             Modulation::Ofdm(ofdm) => self.configure_ofdm(ofdm),
+            Modulation::Qpsk(qpsk) => self.configure_qpsk(qpsk),
             _ => Err(RadioError::IncorrectConfig),
         }
+    }
+
+    pub fn set_fcs(&mut self, enabled: bool) -> Result<(), RadioError> {
+        const FCSFE_BIT: u8 = 0b0100_0000;
+        const TXAFCS_BIT: u8 = 0b0001_0000;
+
+        let value = if enabled { TXAFCS_BIT | FCSFE_BIT } else { 0 };
+
+        self.bus.modify_reg_u8(
+            Self::abs_reg(regs::RG_BBCX_PC),
+            TXAFCS_BIT | FCSFE_BIT,
+            value,
+        )?;
+
+        Ok(())
     }
 
     pub fn enable(&mut self) -> Result<(), RadioError> {
@@ -111,20 +196,23 @@ where
     }
 
     pub fn set_enabled(&mut self, enabled: bool) -> Result<(), RadioError> {
-        let mut value = self.bus.read_reg_u8(Self::abs_reg(regs::RG_BBCX_PC))?;
-
         const BBEN_BIT: u8 = 0b0000_0100;
 
-        if enabled {
-            value = value | BBEN_BIT;
-        } else {
-            value = value & (!BBEN_BIT);
-        }
+        let value = if enabled { BBEN_BIT } else { 0 };
 
         self.bus
-            .write_reg_u8(Self::abs_reg(regs::RG_BBCX_PC), value)?;
+            .modify_reg_u8(Self::abs_reg(regs::RG_BBCX_PC), BBEN_BIT, value)?;
 
         Ok(())
+    }
+
+    pub fn read_counter(&mut self) -> Result<u32, RadioError> {
+        let mut bytes = [0u8; 4];
+
+        self.bus
+            .read_regs(Self::abs_reg(regs::RG_BBCX_CNT0), &mut bytes[..])?;
+
+        Ok(u32::from_le_bytes(bytes))
     }
 
     fn configure_ofdm(&mut self, modulation: &OfdmModulation) -> Result<(), RadioError> {
@@ -142,12 +230,28 @@ where
         Ok(())
     }
 
+    fn configure_qpsk(&mut self, modulation: &QpskModulation) -> Result<(), RadioError> {
+        self.bus.modify_reg_u8(
+            Self::abs_reg(regs::RG_BBCX_OQPSKC0),
+            0b0000_0011,
+            modulation.fchip as u8,
+        )?;
+
+        self.bus.modify_reg_u8(
+            Self::abs_reg(regs::RG_BBCX_OQPSKPHRTX),
+            0b0000_1110,
+            (modulation.mode as u8) << 1,
+        )?;
+
+        Ok(())
+    }
+
     pub fn read_irqs(&mut self) -> Result<BasebandInterruptMask, RadioError> {
         let irq_status = self.bus.read_reg_u8(B::BASEBAND_IRQ_ADDRESS)?;
         Ok(BasebandInterruptMask::new_from_mask(irq_status))
     }
 
-    pub fn clear_irq(&mut self) -> Result<(), RadioError> {
+    pub fn clear_irqs(&mut self) -> Result<(), RadioError> {
         let _ = self.read_irqs()?;
         Ok(())
     }

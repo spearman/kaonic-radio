@@ -1,0 +1,15 @@
+[package]
+name = "kaonic-qos"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+
+[dependencies]
+
+# Logging
+log = "0.4"
+
+# Kaonic
+radio-rf215 = { path="../radio-rf215/" }
+kaonic-radio = { path="../kaonic-radio/" }
+

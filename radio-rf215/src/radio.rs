@@ -10,11 +10,48 @@ use crate::{
 pub type RadioFrequency = u32;
 pub type RadioChannel = u16;
 
+#[derive(PartialEq, Clone, Copy)]
 pub struct RadioFrequencyConfig {
     pub freq: RadioFrequency,
     pub channel_spacing: RadioFrequency,
     pub channel: RadioChannel,
     pub pll_lbw: PllLoopBandwidth,
+}
+
+pub struct RadioFrequencyBuilder {
+    config: RadioFrequencyConfig,
+}
+
+impl RadioFrequencyBuilder {
+    pub const fn new() -> Self {
+        Self {
+            config: RadioFrequencyConfig {
+                freq: 869_535_000,
+                channel_spacing: 200_000,
+                channel: 10,
+                pll_lbw: PllLoopBandwidth::Default,
+            },
+        }
+    }
+
+    pub fn freq(mut self, freq: RadioFrequency) -> Self {
+        self.config.freq = freq;
+        self
+    }
+
+    pub fn channel(mut self, channel: RadioChannel) -> Self {
+        self.config.channel = channel;
+        self
+    }
+
+    pub fn channel_spacing(mut self, spacing: RadioFrequency) -> Self {
+        self.config.channel_spacing = spacing;
+        self
+    }
+
+    pub fn build(self) -> RadioFrequencyConfig {
+        self.config
+    }
 }
 
 pub trait Band {
@@ -36,6 +73,15 @@ pub enum FrontendPinConfig {
     Mode1 = 0x01, // (1 pin is TX switch; 1 pin is RX switch; LNA can be bypassed)
     Mode2 = 0x02, // (1 pin is enable, 1 pin is TXRX switch; 1 | 0 additional option)
     Mode3 = 0x03, // (1 pin is TXRX switch, 1 pin is LNA Bypass, 1 pin (MCU) is enable)
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[repr(u8)]
+pub enum EnergyDetectionMode {
+    Auto = 0x00,
+    Single = 0x01,
+    Continuous = 0x02,
+    Off = 0x03,
 }
 
 pub struct AuxiliarySettings {
@@ -92,6 +138,41 @@ pub enum AgcTargetLevel {
     TargetN42dB = 0x07,
 }
 
+pub struct AgcReceiverGain {
+    pub target_level: AgcTargetLevel,
+    pub gcw: u8,
+}
+
+impl Default for AgcReceiverGain {
+    fn default() -> Self {
+        Self {
+            target_level: AgcTargetLevel::TargetN30dB,
+            gcw: 23,
+        }
+    }
+}
+
+// 6.2.5.3 RFn_AGCC – Receiver AGC Control 0
+pub struct AgcReceiverControl {
+    pub agc_input: bool,              // This bit controls the input signal of the AGC
+    pub average_time: AgcAverageTime, // The time of averaging RX data samples for the AGC values is defined by number of samples
+    pub reset: bool,                  // AGC Reset
+    pub freeze_control: bool,         // AGC Freeze Control
+    pub enabled: bool,                // AGC Enable
+}
+
+impl Default for AgcReceiverControl {
+    fn default() -> Self {
+        Self {
+            agc_input: false,
+            average_time: AgcAverageTime::Samples8,
+            reset: false,
+            freeze_control: false,
+            enabled: true,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[repr(u8)]
 pub enum FrequencySampleRate {
@@ -134,6 +215,16 @@ pub enum TransmitterCutOff {
     Flc1000kHz = 0x0B,
 }
 
+/// Power Amplifier Ramp Time
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[repr(u8)]
+pub enum PaRampTime {
+    Paramp4 = 0x00,
+    Paramp8 = 0x01,
+    Paramp16 = 0x02,
+    Paramp32 = 0x03,
+}
+
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[repr(u8)]
 pub enum ReceiverBandwidth {
@@ -143,11 +234,11 @@ pub enum ReceiverBandwidth {
     Bw320kHzIf500kHz = 0x3,   // fBW=320kHz; fIF=500kHz
     Bw400kHzIf500kHz = 0x4,   // fBW=400kHz; fIF=500kHz
     Bw500kHzIf500kHz = 0x5,   // fBW=500kHz; fIF=500kHz
-    Bw630kHzIf1000kHz = 0x6,  //  fBW=630kHz; fIF=1000kHz
+    Bw630kHzIf1000kHz = 0x6,  // fBW=630kHz; fIF=1000kHz
     Bw800kHzIf1000kHz = 0x7,  // fBW=800kHz; fIF=1000kHz
     Bw1000kHzIf1000kHz = 0x8, // fBW=1000kHz; fIF=1000kHz
-    Bw1250kHzIf2000kHz = 0x9, //fBW=1250kHz; fIF=2000kHz
-    Bw1600kHzIf2000kHz = 0xA, //fBW=1600kHz; fIF=2000kHz
+    Bw1250kHzIf2000kHz = 0x9, // fBW=1250kHz; fIF=2000kHz
+    Bw1600kHzIf2000kHz = 0xA, // fBW=1600kHz; fIF=2000kHz
     Bw2000kHzIf2000kHz = 0xB, // fBW=2000kHz; fIF=2000kHz
 }
 
@@ -156,6 +247,7 @@ pub struct RadioTransmitterConfig {
     pub sr: FrequencySampleRate,
     pub rcut: RelativeCutOff,
     pub lpfcut: TransmitterCutOff,
+    pub paramp: PaRampTime,
     pub pacur: PaCur,
     pub power: u8,
 }
@@ -166,6 +258,7 @@ impl Default for RadioTransmitterConfig {
             sr: FrequencySampleRate::SampleRate4000kHz,
             rcut: RelativeCutOff::Fcut0_250,
             lpfcut: TransmitterCutOff::Flc500kHz,
+            paramp: PaRampTime::Paramp4,
             pacur: PaCur::NoReduction,
             power: 1,
         }
@@ -196,6 +289,9 @@ impl Default for RadioReceiverConfig {
 pub struct RadioTransreceiverConfig {
     pub tx_config: RadioTransmitterConfig,
     pub rx_config: RadioReceiverConfig,
+    pub agc_control: AgcReceiverControl,
+    pub agc_gain: AgcReceiverGain,
+    pub edd: core::time::Duration,
 }
 
 impl Default for RadioTransreceiverConfig {
@@ -203,6 +299,9 @@ impl Default for RadioTransreceiverConfig {
         Self {
             tx_config: Default::default(),
             rx_config: Default::default(),
+            agc_control: Default::default(),
+            agc_gain: Default::default(),
+            edd: core::time::Duration::from_micros(128),
         }
     }
 }
@@ -384,6 +483,8 @@ where
             }
         }
 
+        self.bus.delay(core::time::Duration::from_micros(100));
+
         self.set_state(RadioState::Rx)?;
 
         self.wait_on_state(core::time::Duration::from_millis(100), |s| {
@@ -434,6 +535,13 @@ where
         Ok(())
     }
 
+    pub fn update_frequency(&mut self) -> Result<(), RadioError> {
+        self.bus
+            .modify_reg_u8(Self::abs_reg(regs::RG_RFXX_CNM), 0x00, 0x00)?;
+
+        Ok(())
+    }
+
     pub fn read_rssi(&mut self) -> Result<i8, RadioError> {
         let value = self.bus.read_reg_u8(Self::abs_reg(regs::RG_RFXX_RSSI))?;
         let rssi = value as i8;
@@ -445,11 +553,44 @@ where
         Ok(rssi)
     }
 
+    pub fn read_edv(&mut self) -> Result<i8, RadioError> {
+        let value = self.bus.read_reg_u8(Self::abs_reg(regs::RG_RFXX_EDV))?;
+        let edv = value as i8;
+
+        Ok(edv)
+    }
+
+    pub fn set_ed_mode(&mut self, mode: EnergyDetectionMode) -> Result<(), RadioError> {
+        self.bus
+            .write_reg_u8(Self::abs_reg(regs::RG_RFXX_EDC), mode as u8)?;
+
+        Ok(())
+    }
+
+    pub fn set_ed_duration(&mut self, duration: core::time::Duration) -> Result<(), RadioError> {
+        let dtb_mul: [u32; 4] = [2, 8, 32, 128];
+
+        let expected_duration = duration.as_micros() as u32;
+        for i in 0..dtb_mul.len() {
+            let df = expected_duration / dtb_mul[i];
+            if df < 63 {
+                let edd = ((df as u8) << 2) | (i as u8);
+
+                self.bus
+                    .write_reg_u8(Self::abs_reg(regs::RG_RFXX_EDD), edd)?;
+
+                return Ok(());
+            }
+        }
+
+        Err(RadioError::IncorrectConfig)
+    }
+
     pub fn wait_irq(
         &mut self,
         irq_mask: RadioInterruptMask,
         timeout: core::time::Duration,
-    ) -> bool {
+    ) -> Option<RadioInterruptMask> {
         let deadline = self.bus.deadline(timeout);
 
         loop {
@@ -459,17 +600,44 @@ where
 
             if self
                 .bus
-                .wait_interrupt(core::time::Duration::from_micros(100))
+                .wait_interrupt(core::time::Duration::from_micros(500))
             {
                 if let Ok(irqs) = self.read_irqs() {
                     if irqs.has_irqs(irq_mask) {
-                        return true;
+                        return Some(irqs);
                     }
                 }
             }
         }
 
-        return false;
+        return None;
+    }
+
+    pub fn wait_any_irq(
+        &mut self,
+        irq_mask: RadioInterruptMask,
+        timeout: core::time::Duration,
+    ) -> Option<RadioInterruptMask> {
+        let deadline = self.bus.deadline(timeout);
+
+        loop {
+            if self.bus.deadline_reached(deadline) {
+                break;
+            }
+
+            if self
+                .bus
+                .wait_interrupt(core::time::Duration::from_micros(500))
+            {
+                if let Ok(irqs) = self.read_irqs() {
+                    if irqs.has_any_irqs(irq_mask) {
+                        return Some(irqs);
+                    }
+                }
+            }
+        }
+
+        return None;
     }
 
     pub fn read_irqs(&mut self) -> Result<RadioInterruptMask, RadioError> {
@@ -477,7 +645,7 @@ where
         Ok(RadioInterruptMask::new_from_mask(irq_status))
     }
 
-    pub fn clear_irq(&mut self) -> Result<(), RadioError> {
+    pub fn clear_irqs(&mut self) -> Result<(), RadioError> {
         let _ = self.read_irqs()?;
         Ok(())
     }
@@ -503,8 +671,8 @@ where
             let mut txcutc = self.bus.read_reg_u8(Self::abs_reg(regs::RG_RFXX_TXCUTC))?;
 
             // Clear SR and RCUT bits
-            txcutc = txcutc & 0b1111_0000;
-            txcutc = txcutc | (config.lpfcut as u8);
+            txcutc = txcutc & 0b0011_0000;
+            txcutc = txcutc | (config.lpfcut as u8) | ((config.paramp as u8) << 6);
 
             self.bus
                 .write_reg_u8(Self::abs_reg(regs::RG_RFXX_TXCUTC), txcutc)?;
@@ -565,20 +733,65 @@ where
     ) -> Result<(), RadioError> {
         self.configure_transmitter(&config.tx_config)?;
         self.configure_receiver(&config.rx_config)?;
+        self.set_agc_control(&config.agc_control)?;
+        self.set_agc_gain(&config.agc_gain)?;
+        self.set_ed_duration(config.edd)?;
 
         Ok(())
     }
 
-    pub fn set_control_pad(&mut self, config: FrontendPinConfig) -> Result<(), RadioError> {
+    pub fn set_control_pad(&mut self, config: FrontendPinConfig) -> Result<&mut Self, RadioError> {
         let padfe = (config as u8) << 6;
 
         self.bus
-            .write_reg_u8(Self::abs_reg(regs::RG_RFXX_RXBWC), padfe)?;
+            .write_reg_u8(Self::abs_reg(regs::RG_RFXX_PADFE), padfe)?;
+
+        Ok(self)
+    }
+
+    pub fn set_agc_control(&mut self, agc_control: &AgcReceiverControl) -> Result<(), RadioError> {
+        let mut agcc = 0u8;
+
+        if agc_control.enabled {
+            agcc = agcc | 0b0000_0001;
+        }
+
+        if agc_control.agc_input {
+            agcc = agcc | 0b0100_0000;
+        }
+
+        if agc_control.freeze_control {
+            agcc = agcc | 0b0000_0010;
+        }
+
+        if agc_control.reset {
+            agcc = agcc | 0b0000_1000;
+        }
+
+        agcc = agcc | ((agc_control.average_time as u8) << 4);
+
+        self.bus
+            .write_reg_u8(Self::abs_reg(regs::RG_RFXX_AGCC), agcc)?;
 
         Ok(())
     }
 
-    pub fn set_aux_settings(&mut self, settings: AuxiliarySettings) -> Result<(), RadioError> {
+    pub fn set_agc_gain(&mut self, agc_gain: &AgcReceiverGain) -> Result<&mut Self, RadioError> {
+        let mut agcs = 0u8;
+
+        agcs = agcs | ((agc_gain.target_level as u8) << 5);
+        agcs = agcs | core::cmp::min(23, agc_gain.gcw);
+
+        self.bus
+            .write_reg_u8(Self::abs_reg(regs::RG_RFXX_AGCS), agcs)?;
+
+        Ok(self)
+    }
+
+    pub fn set_aux_settings(
+        &mut self,
+        settings: AuxiliarySettings,
+    ) -> Result<&mut Self, RadioError> {
         let mut auxs = 0u8;
 
         auxs = auxs | (settings.map as u8) << 5;
@@ -599,7 +812,7 @@ where
         self.bus
             .write_reg_u8(Self::abs_reg(regs::RG_RFXX_AUXS), auxs)?;
 
-        Ok(())
+        Ok(self)
     }
 
     pub fn reset(&mut self) -> Result<(), RadioError> {
@@ -608,6 +821,10 @@ where
         self.set_state(RadioState::TrxOff)?;
 
         Ok(())
+    }
+
+    pub const fn check_band(freq: RadioFrequency) -> bool {
+        (freq <= B::MAX_FREQUENCY) && (freq >= B::MIN_FREQUENCY)
     }
 
     /// Returns absolute register address for a specified `Band`

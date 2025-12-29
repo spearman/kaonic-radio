@@ -37,6 +37,11 @@ message RadioPhyConfigOFDM {
   uint32 opt = 2;
 }
 
+message RadioPhyConfigQPSK {
+  uint32 chip_freq = 1;
+  uint32 rate_mode = 2;
+}
+
 message RadioPhyConfigFSK {
   uint32 bt = 1;
   uint32 midxs = 2;
@@ -70,6 +75,19 @@ message RadioPhyConfigFSK {
   uint32 fskpe2 = 30;
 }
 
+message QoSConfig {
+  bool enabled = 1;
+  bool adaptive_modulation = 2;
+  bool adaptive_tx_power = 3;
+  bool adaptive_backoff = 4;
+  int32 cca_threshold = 5; // Clear Channel Assessment threshold in dBm
+}
+
+enum BandwidthFilter {
+  BANDWIDTH_FILTER_NARROW = 0;
+  BANDWIDTH_FILTER_WIDE = 1;
+}
+
 message ConfigurationRequest {
   RadioModule module = 1;
 
@@ -81,7 +99,11 @@ message ConfigurationRequest {
   oneof phy_config {
     RadioPhyConfigOFDM ofdm = 8;
     RadioPhyConfigFSK fsk = 9;
+    RadioPhyConfigQPSK qpsk = 10;
   }
+
+  QoSConfig qos = 11;
+  BandwidthFilter bandwidth_filter = 12;
 }
 
 message TransmitRequest {

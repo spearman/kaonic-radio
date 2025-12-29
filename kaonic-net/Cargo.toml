@@ -1,0 +1,18 @@
+[package]
+name = "kaonic-net"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+
+[dependencies]
+
+labrador-ldpc = "1.2.1"
+
+crc = "=3.3.0"
+
+log = "0.4"
+
+# Kaonic
+kaonic-radio = { path="../kaonic-radio/" }
+kaonic-qos = { path="../kaonic-qos/" }
+
