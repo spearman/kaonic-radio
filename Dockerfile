@@ -1,6 +1,7 @@
 FROM ubuntu:24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
+ARG SDK_ASSET_NAME="stm32mp1-kaonic-proto-sdk-aarch64.sh"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \ 
     ca-certificates \
