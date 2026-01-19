@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ninja-build \
     neovim \
     openssh-client \
+    protobuf-compiler \
     rsync \
     file \
     libclang-dev \
@@ -25,6 +26,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && mkdir -p /opt/
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+RUN rustup target add armv7-unknown-linux-gnueabihf
 
 # Download latest Yocto SDK
 RUN set -e && DOWNLOAD_URL=$(curl -s https://api.github.com/repos/BeechatNetworkSystemsLtd/kaonic-yocto/releases/latest \
