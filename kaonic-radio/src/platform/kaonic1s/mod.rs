@@ -1,4 +1,14 @@
-use radio_rf215::{baseband::BasebandFrame, bus::SpiBus, radio::RadioFrequencyBuilder, Rf215};
+use std::{
+    sync::{atomic::AtomicUsize, Arc, Mutex},
+    time::Instant,
+};
+
+use radio_rf215::{
+    baseband::BasebandFrame,
+    bus::{BusInterrupt, SpiBus},
+    radio::RadioFrequencyBuilder,
+    Rf215,
+};
 
 use crate::{
     error::KaonicError,
@@ -9,6 +19,7 @@ use crate::{
         linux::{
             LinuxClock, LinuxGpioInterrupt, LinuxGpioReset, LinuxOutputPin, LinuxSpi, SharedBus,
         },
+        linux_rf215::AtomicInterrupt,
         platform_impl::rf215::map_modulation,
     },
     radio::{BandwidthFilter, Hertz, Radio, RadioConfig, ReceiveResult, ScanResult},
@@ -18,7 +29,7 @@ mod machine;
 
 pub const FRAME_SIZE: usize = 2048usize;
 
-pub type Kaonic1SBus = SpiBus<LinuxSpi, LinuxGpioInterrupt, LinuxClock, LinuxGpioReset>;
+pub type Kaonic1SBus = SpiBus<LinuxSpi, AtomicInterrupt, LinuxClock, LinuxGpioReset>;
 
 pub struct Kaonic1SRadioFem {
     flt_v1: LinuxOutputPin,
@@ -86,7 +97,7 @@ impl Kaonic1SRadioFem {
 
     pub fn adjust(&mut self, config: &RadioConfig) -> Result<(), KaonicError> {
         if let Some(ant_24) = &mut self.ant_24 {
-            ant_24.set_high()?;
+            ant_24.set_low()?;
         }
 
         self.set_bandwidth_filter(config.bandwidth_filter, config.freq)?;
@@ -101,31 +112,61 @@ impl Kaonic1SRadioFem {
 pub type Kaonic1SFrame = Frame<FRAME_SIZE>;
 pub type Kaonic1SRf215 = Rf215<SharedBus<Kaonic1SBus>>;
 
+pub struct Kaonic1SRadioEvent {
+    counter: Arc<AtomicUsize>,
+    irq: LinuxGpioInterrupt,
+}
+
+impl Kaonic1SRadioEvent {
+    pub fn new(counter: Arc<AtomicUsize>, irq: LinuxGpioInterrupt) -> Self {
+        Self { counter, irq }
+    }
+
+    pub fn wait_for_event(&mut self, timeout: Option<core::time::Duration>) -> bool {
+        if self.irq.wait_on_interrupt(timeout) {
+            self.counter
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            return true;
+        }
+
+        false
+    }
+}
+
 pub struct Kaonic1SRadio {
     fem: Kaonic1SRadioFem,
     radio: Kaonic1SRf215,
+    event: Arc<Mutex<Kaonic1SRadioEvent>>,
     bb_frame: BasebandFrame,
 
     modulation: Modulation,
 
-    snr: i8,
     noise_dbm: i8,
 }
 
 impl Kaonic1SRadio {
-    pub fn new(radio: Rf215<SharedBus<Kaonic1SBus>>, fem: Kaonic1SRadioFem) -> Self {
+    pub fn new(
+        radio: Rf215<SharedBus<Kaonic1SBus>>,
+        event: Kaonic1SRadioEvent,
+        fem: Kaonic1SRadioFem,
+    ) -> Self {
         Self {
             radio,
+            event: Arc::new(Mutex::new(event)),
             fem,
             bb_frame: BasebandFrame::new(),
             modulation: Modulation::Ofdm(OfdmModulation::default()),
-            snr: 0,
             noise_dbm: -127,
         }
     }
 
     pub fn radio(&mut self) -> &mut Kaonic1SRf215 {
         &mut self.radio
+    }
+
+    pub fn event(&self) -> Arc<Mutex<Kaonic1SRadioEvent>> {
+        self.event.clone()
     }
 }
 
@@ -161,14 +202,42 @@ impl Radio for Kaonic1SRadio {
         Ok(())
     }
 
-    fn transmit(&mut self, frame: &Self::TxFrame) -> Result<(), KaonicError> {
-        log::trace!("TX ({}): {} Bytes", self.radio.name(), frame.len());
-
+    fn update_event(&mut self) -> Result<(), KaonicError> {
         self.radio
-            .bb_transmit(&BasebandFrame::new_from_slice(frame.as_slice()))
+            .update_irqs()
             .map_err(|_| KaonicError::HardwareError)?;
 
         Ok(())
+    }
+
+    fn transmit(&mut self, frame: &Self::TxFrame) -> Result<(), KaonicError> {
+        let mut result = Ok(());
+        for i in 0..4 {
+            let start = Instant::now();
+
+            result = self
+                .radio
+                .bb_transmit(&BasebandFrame::new_from_slice(frame.as_slice()))
+                .map_err(|_| KaonicError::HardwareError);
+
+            if result.is_err() {
+                log::error!("tx [{}] error", self.radio.name());
+                std::thread::sleep(core::time::Duration::from_millis(4));
+            } else {
+                log::trace!(
+                    "tx [{}] -))) |o| {:>4} bytes {:>4}us",
+                    self.radio.name(),
+                    frame.len(),
+                    start.elapsed().as_micros(),
+                );
+
+                break;
+            }
+        }
+
+        let _ = self.radio.start_receive();
+
+        result
     }
 
     fn receive<'a>(
@@ -176,18 +245,21 @@ impl Radio for Kaonic1SRadio {
         frame: &'a mut Self::RxFrame,
         timeout: core::time::Duration,
     ) -> Result<ReceiveResult, KaonicError> {
+        let start = Instant::now();
+
         let result = self.radio.bb_receive(&mut self.bb_frame, timeout);
 
-        let edv = self.radio.read_edv().unwrap_or(127);
+        let edv = 0; //self.radio.read_edv().unwrap_or(127);
+
+        let _ = self.radio.start_receive();
 
         match result {
             Ok(_) => {
                 log::trace!(
-                    "RX ({}): RSSI:{}dBm {}dBm {}B",
+                    "rx [{}] (((- |o| {:>4} bytes {:>3}us",
                     self.radio.name(),
-                    edv,
-                    self.noise_dbm,
-                    frame.len()
+                    self.bb_frame.len(),
+                    start.elapsed().as_micros(),
                 );
 
                 frame.copy_from_slice(self.bb_frame.as_slice());

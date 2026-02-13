@@ -1,11 +1,12 @@
-use crate::grpc_client::{GrpcClient, PacketType, ReceiveEvent};
+use crate::grpc_client::{GrpcClient, ReceiveEvent, TxTarget};
 use crate::kaonic::{configuration_request::PhyConfig, QoSConfig, RadioModule, RadioPhyConfigOfdm, RadioPhyConfigQpsk};
 use imgui::*;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::runtime::Runtime;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
+use crate::iperf::{start_client, start_server_monitor};
 
 pub struct AppState {
     // Connection
@@ -43,11 +44,13 @@ pub struct AppState {
     pub last_tx_latency: Option<u32>,
     pub continuous_tx: bool,
     pub tx_pause_ms: i32,
+    pub tx_target: i32, // 0 = Module, 1 = Network
 
     // Receive
     pub rx_events: Vec<ReceiveEvent>,
     pub rx_stream_active: bool,
     pub max_rx_events: usize,
+    pub selected_index: Option<usize>,
 
     // RSSI visualization
     pub rssi_history: Vec<(Instant, i32)>, // (timestamp, rssi)
@@ -58,13 +61,24 @@ pub struct AppState {
     pub waterfall_max_entries: usize,
     
     // Packet type statistics
-    pub reticulum_count: usize,
-    pub custom_count: usize,
+    // (packet type statistics removed)
     
     // OTA
     pub ota_file_path: String,
     pub ota_status: String,
     pub ota_version: String,
+        // iPerf
+        pub iperf_server_running: bool,
+        pub iperf_client_running: bool,
+        pub iperf_duration_secs: u64,
+        pub iperf_max_payload: usize,
+        pub iperf_interval_ms: u64,
+        pub iperf_key: u32,
+        pub iperf_status: String,
+        pub iperf_output: String,
+        pub iperf_key_text: String,
+        pub iperf_client_kbps: f64,
+        pub iperf_server_kbps: f64,
 }
 
 impl AppState {
@@ -99,10 +113,12 @@ impl AppState {
             last_tx_latency: None,
             continuous_tx: false,
             tx_pause_ms: 1000,
+            tx_target: 0,
 
             rx_events: Vec::new(),
             rx_stream_active: false,
             max_rx_events: 100,
+            selected_index: None,
 
             rssi_history: Vec::new(),
             rssi_window_secs: 30.0,
@@ -110,12 +126,23 @@ impl AppState {
             waterfall_data: Vec::new(),
             waterfall_max_entries: 500,
             
-            reticulum_count: 0,
-            custom_count: 0,
+            
             
             ota_file_path: String::new(),
             ota_status: String::new(),
             ota_version: String::new(),
+            // iPerf defaults
+            iperf_server_running: false,
+            iperf_client_running: false,
+            iperf_duration_secs: 10,
+            iperf_max_payload: 512,
+            iperf_interval_ms: 100,
+            iperf_key: 1,
+            iperf_key_text: "IPRF".to_string(),
+            iperf_client_kbps: 0.0,
+            iperf_server_kbps: 0.0,
+            iperf_status: String::new(),
+            iperf_output: String::new(),
         }
     }
 }
@@ -127,6 +154,9 @@ pub struct RadioGuiApp {
     rx_receiver: Arc<Mutex<Option<mpsc::UnboundedReceiver<ReceiveEvent>>>>,
     pub last_frame: Instant,
     last_tx_time: Instant,
+    // iPerf task handles
+    iperf_server_task: Option<tokio::task::JoinHandle<()>>,
+    iperf_client_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl RadioGuiApp {
@@ -142,6 +172,8 @@ impl RadioGuiApp {
             rx_receiver: Arc::new(Mutex::new(None)),
             last_frame: Instant::now(),
             last_tx_time: Instant::now(),
+            iperf_server_task: None,
+            iperf_client_task: None,
         }
     }
 
@@ -153,11 +185,7 @@ impl RadioGuiApp {
             while let Ok(event) = rx.try_recv() {
                 let mut state = self.state.lock();
                 
-                // Update packet type statistics
-                match event.packet_type {
-                    PacketType::Reticulum => state.reticulum_count += 1,
-                    PacketType::Custom => state.custom_count += 1,
-                }
+                // (packet type statistics removed)
                 
                 // Add to events list
                 state.rx_events.push(event.clone());
@@ -205,13 +233,34 @@ impl RadioGuiApp {
                 };
                 
                 drop(state);
-                
-                match self.client.lock().transmit_frame(module, data) {
-                    Ok(latency) => {
-                        let mut state = self.state.lock();
-                        state.last_tx_latency = Some(latency);
-                    }
-                    Err(_) => {}
+
+                // Enqueue non-blocking and await response in background to keep UI responsive
+                let data_len = data.len();
+                let (resp_tx, resp_rx) = oneshot::channel::<Result<u32, String>>();
+                let req = crate::grpc_client::TxRequest { target: TxTarget::Radio(module), payload: data, resp: Some(resp_tx) };
+                if let Err(e) = self.client.lock().tx_enqueue(req) {
+                    let mut s = self.state.lock();
+                    s.status_message = format!("TX enqueue failed: {}", e);
+                } else {
+                    let state_clone = Arc::clone(&self.state);
+                    let runtime = self.runtime.clone();
+                    runtime.spawn(async move {
+                        match resp_rx.await {
+                            Ok(Ok(lat)) => {
+                                let mut s = state_clone.lock();
+                                s.last_tx_latency = Some(lat);
+                                s.status_message = format!("Transmitted {} bytes (latency: {} ms)", data_len, lat);
+                            }
+                            Ok(Err(e)) => {
+                                let mut s = state_clone.lock();
+                                s.status_message = format!("Transmit failed: {}", e);
+                            }
+                            Err(_) => {
+                                let mut s = state_clone.lock();
+                                s.status_message = "Transmit response channel closed".to_string();
+                            }
+                        }
+                    });
                 }
                 
                 self.last_tx_time = now;
@@ -269,6 +318,14 @@ impl RadioGuiApp {
                         }
                         ui.separator();
                         
+                        // iPerf Section
+                        if ui.collapsing_header("iPerf", TreeNodeFlags::empty()) {
+                            ui.indent();
+                            self.draw_iperf_panel(ui);
+                            ui.unindent();
+                        }
+                        ui.separator();
+
                         // OTA Section
                         if ui.collapsing_header("OTA Update", TreeNodeFlags::empty()) {
                             ui.indent();
@@ -279,17 +336,14 @@ impl RadioGuiApp {
 
                 ui.same_line();
 
-                // Right column - Receive
+                // Right column - Packets (always visible)
                 ui.child_window("right_panel")
                     .size([0.0, panel_height])
                     .border(true)
                     .build(|| {
-                        // Receive Section
-                        if ui.collapsing_header("Receive", TreeNodeFlags::DEFAULT_OPEN) {
-                            ui.indent();
-                            self.draw_receive_panel(ui);
-                            ui.unindent();
-                        }
+                        ui.text("Packets");
+                        ui.separator();
+                        self.draw_receive_panel(ui);
                     });
                 
                 // Status bar at bottom
@@ -350,7 +404,7 @@ impl RadioGuiApp {
         }
     }
 
-    fn start_receiving(&mut self) {
+    pub fn start_receiving(&mut self) {
         let mut state = self.state.lock();
         if !state.connected || state.rx_stream_active {
             return;
@@ -358,14 +412,15 @@ impl RadioGuiApp {
 
         let (tx, rx) = mpsc::unbounded_channel();
         *self.rx_receiver.lock() = Some(rx);
+        // Start receive streams for both modules and merge into the same channel
+        self.client.lock().start_receive_stream(RadioModule::ModuleA, tx.clone());
+        self.client.lock().start_receive_stream(RadioModule::ModuleB, tx.clone());
+        // Also subscribe to network-level receive stream and merge
+        self.client.lock().start_network_receive_stream(tx);
 
-        let module = if state.selected_module == 0 {
-            RadioModule::ModuleA
-        } else {
-            RadioModule::ModuleB
-        };
-
-        self.client.lock().start_receive_stream(module, tx);
+        // GUI will receive events via the merged `mpsc` receiver we passed to the
+        // `start_receive_stream` calls above. Do not also subscribe to the
+        // broadcast channel here, or events will be duplicated.
         state.rx_stream_active = true;
         state.status_message = "Receive stream started".to_string();
     }
@@ -374,13 +429,33 @@ impl RadioGuiApp {
         ui.text("Radio");
         ui.separator();
 
-        let mut state = self.state.lock();
+        // Handle module selection and possible stream restart without holding
+        // the `state` lock while calling `start_receiving` (avoids borrow conflicts).
+        {
+            let mut state = self.state.lock();
 
-        ui.text("Module:");
-        ui.same_line();
-        ui.radio_button("Module A", &mut state.selected_module, 0);
-        ui.same_line();
-        ui.radio_button("Module B", &mut state.selected_module, 1);
+            ui.text("Module:");
+            ui.same_line();
+            let prev_selected = state.selected_module;
+            ui.radio_button("Module A", &mut state.selected_module, 0);
+            ui.same_line();
+            ui.radio_button("Module B", &mut state.selected_module, 1);
+
+            let selected_changed = prev_selected != state.selected_module;
+            let was_connected = state.connected;
+            let was_rx_active = state.rx_stream_active;
+
+            if selected_changed && was_connected && was_rx_active {
+                state.rx_stream_active = false;
+                state.status_message = "Restarting receive stream...".to_string();
+                // drop lock before performing operations that borrow `self` mutably
+                drop(state);
+                *self.rx_receiver.lock() = None;
+                self.start_receiving();
+            }
+        }
+
+        let mut state = self.state.lock();
 
         ui.text("Frequency (MHz):");
         ui.set_next_item_width(-1.0);
@@ -417,6 +492,7 @@ impl RadioGuiApp {
         } else {
             vec![]
         };
+        
         
         ui.slider("##txpower", 0, 31, &mut state.tx_power);
         
@@ -567,6 +643,12 @@ impl RadioGuiApp {
         let mut state = self.state.lock();
         let enabled = state.connected;
 
+        ui.text("Target:");
+        ui.same_line();
+        ui.radio_button("Module", &mut state.tx_target, 0);
+        ui.same_line();
+        ui.radio_button("Network", &mut state.tx_target, 1);
+
         ui.text("Data:");
         ui.set_next_item_width(-1.0);
         ui.input_text("##txdata", &mut state.tx_data).build();
@@ -607,25 +689,71 @@ impl RadioGuiApp {
                 state.tx_data.as_bytes().to_vec()
             };
 
-            let module = if state.selected_module == 0 {
-                RadioModule::ModuleA
-            } else {
-                RadioModule::ModuleB
-            };
-            drop(state);
-
             let data_len = data.len();
-            match self.client.lock().transmit_frame(module, data) {
-                Ok(latency) => {
-                    let mut state = self.state.lock();
-                    state.last_tx_latency = Some(latency);
-                    state.status_message = format!("Transmitted {} bytes (latency: {} ms)", data_len, latency);
+            let result = if state.tx_target == 0 {
+                let module = if state.selected_module == 0 {
+                    RadioModule::ModuleA
+                } else {
+                    RadioModule::ModuleB
+                };
+                drop(state);
+                // Enqueue and await in background
+                let (resp_tx, resp_rx) = oneshot::channel::<Result<u32, String>>();
+                let req = crate::grpc_client::TxRequest { target: TxTarget::Radio(module), payload: data.clone(), resp: Some(resp_tx) };
+                if let Err(e) = self.client.lock().tx_enqueue(req) {
+                    let mut s = self.state.lock();
+                    s.status_message = format!("TX enqueue failed: {}", e);
+                } else {
+                    let state_clone = Arc::clone(&self.state);
+                    let runtime = self.runtime.clone();
+                    runtime.spawn(async move {
+                        match resp_rx.await {
+                            Ok(Ok(lat)) => {
+                                let mut s = state_clone.lock();
+                                s.last_tx_latency = Some(lat);
+                                s.status_message = format!("Transmitted {} bytes (latency: {} ms)", data_len, lat);
+                            }
+                            Ok(Err(e)) => {
+                                let mut s = state_clone.lock();
+                                s.status_message = format!("Transmit failed: {}", e);
+                            }
+                            Err(_) => {
+                                let mut s = state_clone.lock();
+                                s.status_message = "Transmit response channel closed".to_string();
+                            }
+                        }
+                    });
                 }
-                Err(e) => {
-                    let mut state = self.state.lock();
-                    state.status_message = format!("Transmit failed: {}", e);
+            } else {
+                drop(state);
+                // Network target
+                let (resp_tx, resp_rx) = oneshot::channel::<Result<u32, String>>();
+                let req = crate::grpc_client::TxRequest { target: TxTarget::Network, payload: data.clone(), resp: Some(resp_tx) };
+                if let Err(e) = self.client.lock().tx_enqueue(req) {
+                    let mut s = self.state.lock();
+                    s.status_message = format!("TX enqueue failed: {}", e);
+                } else {
+                    let state_clone = Arc::clone(&self.state);
+                    let runtime = self.runtime.clone();
+                    runtime.spawn(async move {
+                        match resp_rx.await {
+                            Ok(Ok(lat)) => {
+                                let mut s = state_clone.lock();
+                                s.last_tx_latency = Some(lat);
+                                s.status_message = format!("Transmitted {} bytes (latency: {} ms)", data_len, lat);
+                            }
+                            Ok(Err(e)) => {
+                                let mut s = state_clone.lock();
+                                s.status_message = format!("Transmit failed: {}", e);
+                            }
+                            Err(_) => {
+                                let mut s = state_clone.lock();
+                                s.status_message = "Transmit response channel closed".to_string();
+                            }
+                        }
+                    });
                 }
-            }
+            };
         }
         drop(_once_token);
 
@@ -738,6 +866,174 @@ impl RadioGuiApp {
             ui.text_wrapped(&ota_status);
         }
     }
+
+    fn draw_iperf_panel(&mut self, ui: &Ui) {
+        // Snapshot state to avoid holding the mutex while rendering UI (prevents deadlocks)
+        let (server_running, client_running, mut duration_i32, mut payload_i32, mut interval_i32, mut key_text, status_snapshot, output_snapshot, client_kbps_snapshot, server_kbps_snapshot) = {
+            let s = self.state.lock();
+            (
+                s.iperf_server_running,
+                s.iperf_client_running,
+                s.iperf_duration_secs as i32,
+                s.iperf_max_payload as i32,
+                s.iperf_interval_ms as i32,
+                s.iperf_key_text.clone(),
+                s.iperf_status.clone(),
+                s.iperf_output.clone(),
+                s.iperf_client_kbps,
+                s.iperf_server_kbps,
+            )
+        };
+
+            let total_kbps_snapshot = client_kbps_snapshot + server_kbps_snapshot;
+
+        ui.text("iPerf (server + client)");
+        ui.separator();
+
+        // Each setting on its own row: label -> input
+        ui.text("Duration (s):");
+        ui.same_line();
+        ui.set_next_item_width(100.0);
+        ui.input_int("##iperf_dur", &mut duration_i32).build();
+
+        ui.separator();
+        ui.text("Max payload (B):");
+        ui.same_line();
+        ui.set_next_item_width(100.0);
+        ui.input_int("##iperf_size", &mut payload_i32).build();
+        
+
+        ui.separator();
+        ui.text("Interval (ms, for latency):");
+        ui.same_line();
+        ui.set_next_item_width(100.0);
+        ui.input_int("##iperf_int", &mut interval_i32).build();
+        
+
+        ui.separator();
+        ui.text("Key (4 chars):");
+        ui.same_line();
+        ui.set_next_item_width(200.0);
+        ui.input_text("##iperf_key_text", &mut key_text).build();
+        if key_text.len() > 4 {
+            key_text.truncate(4);
+        }
+
+        // persist changes immediately so +/- and inputs work without pressing Start
+        {
+            let mut s = self.state.lock();
+            s.iperf_duration_secs = duration_i32.max(0) as u64;
+            s.iperf_max_payload = payload_i32.max(1) as usize;
+            s.iperf_interval_ms = interval_i32.max(1) as u64;
+            s.iperf_key_text = key_text.clone();
+            // convert key_text to u32 (big-endian)
+            let mut kb = [0u8; 4];
+            for (i, &b) in key_text.as_bytes().iter().enumerate().take(4) {
+                kb[i] = b;
+            }
+            s.iperf_key = u32::from_be_bytes(kb);
+        }
+
+        ui.separator();
+
+        // Server control (internal monitor sampling `rx_events`)
+        if server_running {
+            if ui.button("Stop Server") {
+                let mut s = self.state.lock();
+                s.iperf_server_running = false;
+                s.iperf_status = "Stopping server...".to_string();
+            }
+        } else {
+            if ui.button("Start Server") {
+                {
+                    let mut s = self.state.lock();
+                    s.iperf_server_running = true;
+                    s.iperf_status = "Server running".to_string();
+                }
+                let state_clone = Arc::clone(&self.state);
+                // pass client and key to the server monitor
+                let client_clone = Arc::clone(&self.client);
+                let key_val = {
+                    let s = self.state.lock();
+                    s.iperf_key
+                };
+                let _h = start_server_monitor(client_clone, state_clone, key_val);
+            }
+        }
+
+        ui.same_line();
+
+        // Client control (internal sender thread)
+        if client_running {
+            if ui.button("Stop Client") {
+                let mut s = self.state.lock();
+                s.iperf_client_running = false;
+                s.iperf_status = "Stopping client...".to_string();
+            }
+        } else {
+            if ui.button("Start Client") {
+                // Persist any updated parameters then start
+                {
+                    let mut s = self.state.lock();
+                    s.iperf_duration_secs = duration_i32.max(0) as u64;
+                    s.iperf_max_payload = payload_i32.max(1) as usize;
+                    s.iperf_interval_ms = interval_i32.max(1) as u64;
+                    s.iperf_client_running = true;
+                    s.iperf_status = "Client running".to_string();
+                }
+
+                let client = Arc::clone(&self.client);
+                let state_clone = Arc::clone(&self.state);
+                let dur = duration_i32.max(0) as u64;
+                let size = payload_i32.max(1) as usize;
+                let interval = interval_i32.max(1) as u64;
+                let key_val = {
+                    let s = self.state.lock();
+                    s.iperf_key
+                };
+                let _h = start_client(client, state_clone, dur, size, interval, key_val);
+            }
+        }
+
+        ui.separator();
+        ui.text(format!("Status: {}", status_snapshot));
+        ui.text(format!("Total: {:.2} kB/s", total_kbps_snapshot));
+        ui.text(format!("Client: {:.2} kB/s", client_kbps_snapshot));
+        ui.text(format!("Server: {:.2} kB/s", server_kbps_snapshot));
+        if ui.button("Show Output") {
+            ui.open_popup("iperf_output");
+        }
+
+        // Output popup (render last N bytes inside a scrollable child to avoid UI hangs)
+        ui.popup("iperf_output", || {
+            // Use snapshot to avoid locking while rendering
+            let output = output_snapshot.clone();
+
+            // Truncate to last 32 KB for display
+            const MAX_DISPLAY: usize = 32 * 1024;
+            let display = if output.len() > MAX_DISPLAY {
+                let start = output.len() - MAX_DISPLAY;
+                format!("...[truncated]...\n{}", &output[start..])
+            } else {
+                output.clone()
+            };
+
+            ui.child_window("iperf_output_child")
+                .size([0.0, 300.0])
+                .border(true)
+                .flags(WindowFlags::ALWAYS_VERTICAL_SCROLLBAR)
+                .build(|| {
+                    for line in display.lines() {
+                        ui.text_wrapped(line);
+                    }
+                });
+
+            ui.same_line();
+            if ui.button("Close") {
+                ui.close_current_popup();
+            }
+        });
+    }
     
     fn fetch_ota_version(&self, ip: String) {
         let state = Arc::clone(&self.state);
@@ -772,93 +1068,193 @@ impl RadioGuiApp {
     }
 
     fn draw_receive_panel(&mut self, ui: &Ui) {
-        let mut state = self.state.lock();
-        let _enabled = state.connected;
+        // Snapshot minimal state so we don't hold the lock across UI calls
+        let total_packets = { let s = self.state.lock(); s.rx_events.len() };
 
-        // Packet type statistics
-        ui.text(format!("Total: {} packets | Reticulum: {} | Custom: {}", 
-            state.rx_events.len(), 
-            state.reticulum_count, 
-            state.custom_count));
+        // Packet statistics
+        ui.text(format!("Total: {} packets", total_packets));
 
         if ui.button("Clear") {
-            state.rx_events.clear();
-            state.rssi_history.clear();
-            state.waterfall_data.clear();
-            state.reticulum_count = 0;
-            state.custom_count = 0;
+            let mut s = self.state.lock();
+            s.rx_events.clear();
+            s.rssi_history.clear();
+            s.waterfall_data.clear();
         }
 
         ui.separator();
 
-        // Display received frames
-        ui.child_window("rx_events")
-            .size([0.0, 0.0])
-            .build(|| {
-                for (_idx, event) in state.rx_events.iter().rev().enumerate() {
-                    // Packet type with color coding
-                    let (type_char, type_color, bg_color) = match event.packet_type {
-                        PacketType::Reticulum => ("R", [0.0, 0.8, 1.0, 1.0], [0.0, 0.2, 0.3, 1.0]), // Cyan text, dark cyan bg
-                        PacketType::Custom => ("C", [1.0, 0.8, 0.0, 1.0], [0.3, 0.2, 0.0, 1.0]),      // Yellow text, dark yellow bg
-                    };
-                    
-                    // Create a small colored box with type indicator
-                    let _bg_token = ui.push_style_color(StyleColor::ChildBg, bg_color);
-                    ui.child_window(format!("type_column_{}", _idx))
-                        .size([20.0, ui.text_line_height()])
-                        .build(|| {
-                            ui.text_colored(type_color, type_char);
-                        });
-                    _bg_token.pop();
-                    
-                    ui.same_line();
-                    
-                    // Main content area
-                    ui.group(|| {
-                        // Header: time rssi latency packet_size
-                        ui.text(format!("{} {}dBm {}ms {}B", 
-                            event.timestamp.format("%H:%M:%S%.3f"),
-                            event.rssi,
-                            event.latency,
-                            event.frame_data.len()
-                        ));
+        // Snapshot events to iterate without holding the lock
+        let events_snapshot = { let s = self.state.lock(); s.rx_events.clone() };
 
-                        // Content depending on type
-                        if let Some(ref info) = event.reticulum_info {
-                            ui.text(format!("  Type: {} | Hops: {}", info.header_type, info.hops));
-                            if let Some(ref dest) = info.destination {
-                                ui.text("  Destination: ");
-                                ui.same_line();
-                                ui.text_colored([1.0, 0.0, 1.0, 1.0], dest);
-                            }
-                            if let Some(ref transport) = info.transport_id {
-                                ui.text(format!("  Transport ID: {}", transport));
-                            }
-                            ui.text(format!("  Hash: {}", &info.packet_hash));
+        // Determine available space and split into table + preview panels
+        let avail = ui.content_region_avail();
+        let table_height = (avail[1] * 0.65).max(100.0);
+        let preview_height = (avail[1] - table_height).max(80.0);
+
+        // Top: receive table
+        ui.child_window("rx_events_table")
+            .size([0.0, table_height])
+            .border(true)
+            .flags(WindowFlags::ALWAYS_VERTICAL_SCROLLBAR)
+            .build(|| {
+                // Table header (no separate Type column; Source will be colored)
+                ui.columns(6, "rx_table_cols", false);
+                ui.text("Time"); ui.next_column();
+                ui.text("Source"); ui.next_column();
+                ui.text("Size"); ui.next_column();
+                ui.text("RSSI"); ui.next_column();
+                ui.text("Latency"); ui.next_column();
+                ui.text("Preview"); ui.next_column();
+                ui.separator();
+
+                // Show rows (newest last) - we display newest at top
+                for (i, event) in events_snapshot.iter().rev().enumerate() {
+                    let idx = events_snapshot.len().saturating_sub(1 + i);
+
+                    // Choose color by packet type (used for Type text and selection bg)
+                    let (r, g, b, a) = match event.packet_type {
+                        crate::grpc_client::PacketType::Network => (1.0, 0.0, 1.0, 0.12), // magenta
+                        _ => (0.0, 1.0, 1.0, 0.08), // cyan for radio
+                    };
+
+                    // If this row is selected, push header-style background so the whole row is highlighted
+                    let mut _row_guard_t = None;
+                    let mut _row_guard_h = None;
+                    let mut _row_guard_a = None;
+                    {
+                        let s = self.state.lock();
+                        if s.selected_index == Some(idx) {
+                            _row_guard_t = Some(ui.push_style_color(StyleColor::Header, [r, g, b, a]));
+                            _row_guard_h = Some(ui.push_style_color(StyleColor::HeaderHovered, [r, g, b, a * 1.8]));
+                            _row_guard_a = Some(ui.push_style_color(StyleColor::HeaderActive, [r, g, b, a * 2.0]));
                         }
-                        
-                        // Packet data hex (truncated to 64 bytes)
-                        let hex_bytes: Vec<u8> = event.frame_data.iter().take(64).copied().collect();
-                        let hex_str = hex_bytes.iter()
-                            .map(|b| format!("{:02X}", b))
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        
-                        // Display hex data with grey color
-                        ui.text_colored([0.6, 0.6, 0.7, 1.0], format!("  {}", hex_str));
-                        
-                        // Packet data ASCII (. for non-printable)
-                        let ascii_str: String = hex_bytes.iter()
-                            .map(|&b| if b >= 0x20 && b <= 0x7E { b as char } else { '.' })
-                            .collect();
-                        
-                        // Display ASCII data with grey color
-                        ui.text_colored([0.6, 0.6, 0.7, 1.0], format!("  {}", ascii_str));
-                    });
-                    
+                    }
+
+                    // Time column (selectable spans the row because every cell is selectable)
+                    let time_str = event.timestamp.format("%H:%M:%S%.3f").to_string();
+                    let time_label = format!("{}##row{}_time", time_str, idx);
+                    if ui.selectable(&time_label) {
+                        let mut s = self.state.lock();
+                        s.selected_index = Some(idx);
+                    }
+                    ui.next_column();
+
+                    // Source column (module or network) — color the Source text by packet origin
+                    let source = match event.module {
+                        0 => "Module A",
+                        1 => "Module B",
+                        _ => "Network",
+                    };
+                    let src_label = format!("{}##row{}_src", source, idx);
+                    // Color only the Source column text
+                    let text_color = [r, g, b, 1.0_f32];
+                    let _tc = ui.push_style_color(StyleColor::Text, text_color);
+                    if ui.selectable(&src_label) {
+                        let mut s = self.state.lock();
+                        s.selected_index = Some(idx);
+                    }
+                    drop(_tc);
+                    ui.next_column();
+
+                    // Size
+                    let size_label = format!("{} B##row{}_size", event.frame_data.len(), idx);
+                    if ui.selectable(&size_label) {
+                        let mut s = self.state.lock();
+                        s.selected_index = Some(idx);
+                    }
+                    ui.next_column();
+
+                    // RSSI
+                    let rssi_label = format!("{} dBm##row{}_rssi", event.rssi, idx);
+                    if ui.selectable(&rssi_label) {
+                        let mut s = self.state.lock();
+                        s.selected_index = Some(idx);
+                    }
+                    ui.next_column();
+
+                    // Latency
+                    let lat_label = format!("{} ms##row{}_lat", event.latency, idx);
+                    if ui.selectable(&lat_label) {
+                        let mut s = self.state.lock();
+                        s.selected_index = Some(idx);
+                    }
+                    ui.next_column();
+
+                    // Preview short: try to detect an embedded network header and extract ID;
+                    // show parsed ID when available, otherwise mark as Binary.
+                    let mut preview_prefix = String::new();
+                    if let Some(id) = crate::grpc_client::parse_network_id(&event.frame_data) {
+                        preview_prefix = format!("ID:{} ", id);
+                    } else {
+                        preview_prefix = "Binary ".to_string();
+                    }
+
+                    // Show only parsed ID or "Binary" in the preview column (no hex dump)
+                    let preview_text = preview_prefix.trim_end();
+                    let prev_label = format!("{}##row{}_prev", preview_text, idx);
+                    if ui.selectable(&prev_label) {
+                        let mut s = self.state.lock();
+                        s.selected_index = Some(idx);
+                    }
+                    ui.next_column();
+
                     ui.separator();
                 }
+
+                ui.columns(1, "", false);
             });
+
+        // Bottom: preview panel (separate child window)
+        ui.child_window("rx_events_preview")
+            .size([0.0, preview_height])
+            .border(true)
+            .flags(WindowFlags::ALWAYS_VERTICAL_SCROLLBAR | WindowFlags::HORIZONTAL_SCROLLBAR)
+            .build(|| {
+                ui.text("Packet Preview");
+                ui.separator();
+
+                // Clone the selected event under the lock so we can render without holding it
+                let maybe_ev = {
+                    let s = self.state.lock();
+                    if let Some(sel) = s.selected_index {
+                        if sel < s.rx_events.len() {
+                            Some(s.rx_events[sel].clone())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(ev) = maybe_ev {
+                    ui.text(format!("Time: {}", ev.timestamp.format("%Y-%m-%d %H:%M:%S%.3f")));
+                    ui.text(format!("Source: {}", match ev.module {0 => "Module A", 1 => "Module B", _ => "Network"}));
+                    ui.text(format!("Size: {} B", ev.frame_data.len()));
+                    ui.text(format!("RSSI: {} dBm", ev.rssi));
+                    ui.text(format!("Latency: {} ms", ev.latency));
+                    ui.separator();
+                    // Hex dump
+                    let mut hex_lines: Vec<String> = Vec::new();
+                    for chunk in ev.frame_data.chunks(16) {
+                        let hex = chunk.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");
+                        hex_lines.push(hex);
+                    }
+                    for line in hex_lines {
+                        ui.text(line);
+                    }
+                } else {
+                    // Determine whether the selection is out-of-range or absent
+                    let selection_state = { let s = self.state.lock(); s.selected_index };
+                    if selection_state.is_some() {
+                        ui.text("Selected index out of range");
+                    } else {
+                        ui.text("No packet selected");
+                    }
+                }
+            });
+
+        // (preview rendered in dedicated child window above)
     }
 
     fn draw_status_bar(&mut self, ui: &Ui) {
@@ -909,10 +1305,7 @@ impl RadioGuiApp {
         }
         
         // Show TX/RX statistics before RSSI
-        let stats_text = format!("RX: {} | R: {} C: {}", 
-            state.rx_events.len(), 
-            state.reticulum_count, 
-            state.custom_count);
+        let stats_text = format!("RX: {}", state.rx_events.len());
         let stats_width = ui.calc_text_size(&stats_text)[0];
         right_pos -= stats_width + 20.0;
         ui.set_cursor_pos([right_pos, ui.cursor_pos()[1]]);

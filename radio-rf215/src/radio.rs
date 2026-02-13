@@ -367,6 +367,7 @@ where
 {
     _band: PhantomData<B>,
     bus: I,
+    irqs: RadioInterruptMask,
 }
 
 impl<B, I> Radio<B, I>
@@ -378,6 +379,7 @@ where
         Self {
             _band: PhantomData::default(),
             bus,
+            irqs: RadioInterruptMask::new(),
         }
     }
 
@@ -427,7 +429,7 @@ where
                 return Err(RadioError::CommunicationFailure);
             }
 
-            self.bus.delay(core::time::Duration::from_micros(100));
+            self.bus.delay(core::time::Duration::from_micros(200));
         }
     }
 
@@ -459,21 +461,24 @@ where
         Ok(state)
     }
 
-    pub fn wait_interrupt(&mut self, timeout: core::time::Duration) -> bool {
+    pub fn wait_interrupt(&mut self, timeout: Option<core::time::Duration>) -> bool {
         self.bus.wait_interrupt(timeout)
     }
 
     pub fn receive(&mut self) -> Result<(), RadioError> {
+        let mut already_in_rx = false;
+
         loop {
             let state = self.wait_on_state(core::time::Duration::from_millis(100), |s| {
-                (s == RadioState::TrxOff) || (s == RadioState::TrxPrep)
+                (s == RadioState::TrxOff) || (s == RadioState::TrxPrep) || (s == RadioState::Rx)
             });
 
             let mut should_change_state = false;
             if let Err(_) = state {
                 should_change_state = true;
             } else if let Ok(state) = state {
-                should_change_state = state != RadioState::TrxPrep;
+                should_change_state = state != RadioState::TrxPrep && state != RadioState::Rx;
+                already_in_rx = state == RadioState::Rx;
             }
 
             if should_change_state {
@@ -483,13 +488,15 @@ where
             }
         }
 
-        self.bus.delay(core::time::Duration::from_micros(100));
+        if !already_in_rx {
+            self.bus.delay(core::time::Duration::from_micros(200));
 
-        self.set_state(RadioState::Rx)?;
+            self.set_state(RadioState::Rx)?;
 
-        self.wait_on_state(core::time::Duration::from_millis(100), |s| {
-            s == RadioState::Rx
-        })?;
+            self.wait_on_state(core::time::Duration::from_millis(100), |s| {
+                s == RadioState::Rx
+            })?;
+        }
 
         Ok(())
     }
@@ -598,16 +605,14 @@ where
                 break;
             }
 
-            if self
-                .bus
-                .wait_interrupt(core::time::Duration::from_micros(500))
-            {
-                if let Ok(irqs) = self.read_irqs() {
-                    if irqs.has_irqs(irq_mask) {
-                        return Some(irqs);
-                    }
+            if let Ok(_) = self.update_irqs() {
+                if let Some(irqs) = self.irqs.retrieve(&irq_mask) {
+                    return Some(irqs);
                 }
             }
+
+            self.bus
+                .wait_interrupt(Some(core::time::Duration::from_micros(500)));
         }
 
         return None;
@@ -625,29 +630,34 @@ where
                 break;
             }
 
-            if self
-                .bus
-                .wait_interrupt(core::time::Duration::from_micros(500))
-            {
-                if let Ok(irqs) = self.read_irqs() {
-                    if irqs.has_any_irqs(irq_mask) {
-                        return Some(irqs);
-                    }
+            if let Ok(_) = self.update_irqs() {
+                if let Some(irqs) = self.irqs.retrieve_any(&irq_mask) {
+                    return Some(irqs);
                 }
             }
+
+            self.bus
+                .wait_interrupt(Some(core::time::Duration::from_micros(500)));
         }
 
         return None;
     }
 
-    pub fn read_irqs(&mut self) -> Result<RadioInterruptMask, RadioError> {
+    pub fn update_irqs(&mut self) -> Result<&mut Self, RadioError> {
+        let irqs = self.read_irqs()?;
+        self.irqs.combine(&irqs);
+        Ok(self)
+    }
+
+    fn read_irqs(&mut self) -> Result<RadioInterruptMask, RadioError> {
         let irq_status = self.bus.read_reg_u8(B::RADIO_IRQ_ADDRESS)?;
         Ok(RadioInterruptMask::new_from_mask(irq_status))
     }
 
-    pub fn clear_irqs(&mut self) -> Result<(), RadioError> {
+    pub fn clear_irqs(&mut self) -> Result<&mut Self, RadioError> {
         let _ = self.read_irqs()?;
-        Ok(())
+        self.irqs.reset();
+        Ok(self)
     }
 
     pub fn configure_transmitter(

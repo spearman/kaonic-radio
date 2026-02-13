@@ -1,20 +1,26 @@
+use std::sync::{atomic::AtomicUsize, Arc};
+
 use linux_embedded_hal::spidev::SpidevOptions;
 use radio_rf215::{
     bus::{Bus, BusError, SpiBus},
     error::RadioError,
     modulation::{Modulation, OfdmModulation},
-    radio::{AgcGainMap, AuxiliarySettings, FrontendPinConfig, PaVol},
+    radio::{
+        AgcGainMap, AuxiliarySettings, FrontendPinConfig, PaVol, RadioFrequencyBuilder,
+        RadioFrequencyConfig,
+    },
     regs::{BasebandInterrupt, BasebandInterruptMask, RadioInterrupt, RadioInterruptMask},
     transceiver::{Band09, Band24, Transreceiver},
-    Rf215,
+    PadOutputDrive, Rf215,
 };
 
 use crate::platform::{
-    kaonic1s::{Kaonic1SRadio, Kaonic1SRadioFem},
+    kaonic1s::{Kaonic1SRadio, Kaonic1SRadioEvent, Kaonic1SRadioFem},
     linux::{
         LinuxClock, LinuxGpioConfig, LinuxGpioInterrupt, LinuxGpioLineConfig, LinuxGpioReset,
         LinuxOutputPin, LinuxSpi, LinuxSpiConfig, SharedBus,
     },
+    linux_rf215::AtomicInterrupt,
 };
 
 struct RadioBusConfig {
@@ -82,7 +88,7 @@ const RADIO_CONFIG_REV_B: [RadioBusConfig; 2] = [
         irq_gpio: LinuxGpioConfig { line_name: "PD9" },
         spi: LinuxSpiConfig {
             path: "/dev/spidev6.0",
-            max_speed: 5_000_000,
+            max_speed: 12_000_000,
         },
         flt_v1_gpio: LinuxGpioLineConfig {
             chip: "/dev/gpiochip9",
@@ -107,7 +113,7 @@ const RADIO_CONFIG_REV_B: [RadioBusConfig; 2] = [
         irq_gpio: LinuxGpioConfig { line_name: "PE15" },
         spi: LinuxSpiConfig {
             path: "/dev/spidev3.0",
-            max_speed: 5_000_000,
+            max_speed: 12_000_000,
         },
         flt_v1_gpio: LinuxGpioLineConfig {
             chip: "/dev/gpiochip9",
@@ -163,7 +169,7 @@ pub fn create_radios() -> Result<[Option<Kaonic1SRadio>; 2], BusError> {
 
     // Create radios based on selected configuration
     for (index, config) in radio_configs.iter().enumerate() {
-        match create_radio(config) {
+        match create_radio(index, config) {
             Ok(radio) => {
                 radios[index] = Some(radio);
             }
@@ -217,11 +223,18 @@ fn configure_radio_24<I: Bus + Clone>(
     Ok(())
 }
 
-fn configure_radio<I: Bus + Clone>(rf: &mut Rf215<I>) -> Result<(), RadioError> {
+fn configure_radio<I: Bus + Clone>(rf: &mut Rf215<I>, index: usize) -> Result<(), RadioError> {
+    rf.set_config(&radio_rf215::RfConfig {
+        output_drive: PadOutputDrive::Drive8mA,
+        irq_active_low: false,
+        irq_invert: false,
+    })?;
+
     rf.setup_irq(
         RadioInterruptMask::new()
             .add_irq(RadioInterrupt::TransceiverError)
             .add_irq(RadioInterrupt::TransceiverReady)
+            .add_irq(RadioInterrupt::EnergyDetectionCompletion)
             .build(),
         BasebandInterruptMask::new()
             .add_irq(BasebandInterrupt::ReceiverFrameEnd)
@@ -232,13 +245,23 @@ fn configure_radio<I: Bus + Clone>(rf: &mut Rf215<I>) -> Result<(), RadioError> 
     configure_radio_09(rf.trx_09())?;
     configure_radio_24(rf.trx_24())?;
 
-    rf.configure(&Modulation::Ofdm(OfdmModulation::default()))?
-        .start_receive()?;
+    rf.set_frequency(
+        &RadioFrequencyBuilder::new()
+            .freq(869_535_000)
+            .channel((index as u16 + 1) * 5)
+            .build(),
+    )?;
+
+    rf.configure(&Modulation::Ofdm(OfdmModulation {
+        tx_power: 18,
+        ..Default::default()
+    }))?
+    .start_receive()?;
 
     Ok(())
 }
 
-fn create_radio(config: &RadioBusConfig) -> Result<Kaonic1SRadio, BusError> {
+fn create_radio(index: usize, config: &RadioBusConfig) -> Result<Kaonic1SRadio, BusError> {
     let mut spi = LinuxSpi::open(&config.spi.path).map_err(|_| BusError::ControlFailure)?;
 
     spi.configure(
@@ -255,11 +278,17 @@ fn create_radio(config: &RadioBusConfig) -> Result<Kaonic1SRadio, BusError> {
     let interrupt_gpio = LinuxGpioInterrupt::new(&config.irq_gpio.line_name, config.name)
         .map_err(|_| BusError::ControlFailure)?;
 
+    let irq_counter = Arc::new(AtomicUsize::new(0));
+
+    let radio_event = Kaonic1SRadioEvent::new(irq_counter.clone(), interrupt_gpio);
+
+    let interrupt_atomic = AtomicInterrupt::new(irq_counter.clone());
+
     // Create clock (system clock)
     let clock = LinuxClock::new();
 
     // Create the bus with all interfaces
-    let bus = SpiBus::new(spi, interrupt_gpio, clock, reset_gpio);
+    let bus = SpiBus::new(spi, interrupt_atomic, clock, reset_gpio);
 
     let bus = std::sync::Arc::new(std::sync::Mutex::new(bus));
 
@@ -267,7 +296,7 @@ fn create_radio(config: &RadioBusConfig) -> Result<Kaonic1SRadio, BusError> {
     let mut radio = Rf215::probe(SharedBus::new(bus), config.name)?;
 
     // Default configuration for Kaonic1S
-    configure_radio(&mut radio).map_err(|_| BusError::ControlFailure)?;
+    configure_radio(&mut radio, index).map_err(|_| BusError::ControlFailure)?;
 
     let ant_24 = if let Some(ant_24) = &config.ant_24_gpio {
         LinuxOutputPin::new_from_line(
@@ -302,5 +331,5 @@ fn create_radio(config: &RadioBusConfig) -> Result<Kaonic1SRadio, BusError> {
         ant_24,
     );
 
-    Ok(Kaonic1SRadio::new(radio, fem))
+    Ok(Kaonic1SRadio::new(radio, radio_event, fem))
 }

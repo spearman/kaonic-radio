@@ -1,7 +1,8 @@
-use kaonic_radio::{error::KaonicError, platform::kaonic1s::Kaonic1SFrame, radio::Hertz};
+use kaonic_radio::{error::KaonicError, radio::Hertz};
 use std::sync::Arc;
-use tokio::sync::watch;
+use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 
 use super::kaonic::{
@@ -10,8 +11,8 @@ use super::kaonic::{
 };
 
 use crate::{
+    controller::{self, RadioCommand, RadioController},
     grpc::kaonic::RadioFrame,
-    radio_service::{RadioService as Manager, ReceiveEvent},
 };
 
 use kaonic_radio::modulation::{
@@ -20,13 +21,16 @@ use kaonic_radio::modulation::{
 };
 
 pub struct RadioService {
-    mgr: Arc<Manager>,
-    shutdown: watch::Receiver<bool>,
+    radio_ctrl: Arc<Mutex<RadioController>>,
+    shutdown: CancellationToken,
 }
 
 impl RadioService {
-    pub fn new(mgr: Arc<Manager>, shutdown: watch::Receiver<bool>) -> Self {
-        Self { mgr, shutdown }
+    pub fn new(radio_ctrl: Arc<Mutex<RadioController>>, shutdown: CancellationToken) -> Self {
+        Self {
+            radio_ctrl,
+            shutdown,
+        }
     }
 }
 
@@ -56,28 +60,13 @@ impl Radio for RadioService {
             bandwidth_filter,
         };
 
-        self.mgr
-            .configure(module, cfg)
+        self.radio_ctrl
+            .lock()
             .await
-            .map_err(internal_err)?;
-
-        // Configure QoS if provided
-        if let Some(qos_config) = req.qos {
-            log::info!("Configuring QoS for module {}: enabled={}", module, qos_config.enabled);
-            
-            let qos = crate::radio_service::QoSConfig {
-                enabled: qos_config.enabled,
-                adaptive_modulation: qos_config.adaptive_modulation,
-                adaptive_tx_power: qos_config.adaptive_tx_power,
-                adaptive_backoff: qos_config.adaptive_backoff,
-                cca_threshold: qos_config.cca_threshold as i8,
-            };
-
-            self.mgr
-                .configure_qos(module, qos)
-                .await
-                .map_err(internal_err)?;
-        }
+            .execute(RadioCommand::Configure(controller::ModuleConfig {
+                module,
+                config: cfg,
+            }));
 
         if let Some(phy) = req.phy_config {
             log::debug!("parse modulation settings");
@@ -94,10 +83,14 @@ impl Radio for RadioService {
                 module,
                 modulation_type_name(&modulation)
             );
-            self.mgr
-                .set_modulation(module, modulation)
+
+            self.radio_ctrl
+                .lock()
                 .await
-                .map_err(internal_err)?;
+                .execute(RadioCommand::SetModulation(controller::ModuleModulation {
+                    module,
+                    modulation,
+                }));
         } else {
             log::warn!("no modulation settings provided");
         }
@@ -116,18 +109,20 @@ impl Radio for RadioService {
             return Err(Status::invalid_argument("frame can't be empty"));
         }
 
-        let mut frame = Kaonic1SFrame::new();
+        let mut frame = controller::RadioFrame::new();
 
         decode_frame(&req.frame.unwrap(), &mut frame)
             .map_err(|_| Status::resource_exhausted(""))?;
 
-        let latency = self
-            .mgr
-            .transmit(module, &frame)
+        self.radio_ctrl
+            .lock()
             .await
-            .map_err(internal_err)?;
+            .execute(RadioCommand::Transmit(controller::ModuleTransmit {
+                module,
+                frame,
+            }));
 
-        Ok(Response::new(TransmitResponse { latency }))
+        Ok(Response::new(TransmitResponse { latency: 0 }))
     }
 
     type ReceiveStreamStream = ReceiverStream<Result<ReceiveResponse, Status>>;
@@ -142,26 +137,43 @@ impl Radio for RadioService {
         log::debug!("start receive stream for module [{}]", module);
 
         // Subscribe to worker's receive broadcast and forward as gRPC stream
-        let mut sub = self.mgr.subscribe(module).map_err(internal_err)?;
+        let mut sub = self.radio_ctrl.lock().await.module_receive(module);
+
         let (tx, rx) = tokio::sync::mpsc::channel(16);
 
-        // Clone shutdown receiver for this stream
-        let mut shutdown = self.shutdown.clone();
+        // Clone cancellation token for this stream
+        let shutdown = self.shutdown.clone();
 
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    _ = shutdown.changed() => {
+                    _ = shutdown.cancelled() => {
                         break;
                     }
-                    evt = sub.recv() => {
-                        match evt {
-                            Ok(e) => {
-                                if tx.send(Ok(to_receive_response(e))).await.is_err() {
+                    module_recv = sub.recv() => {
+                        match module_recv {
+                            Ok(rx) => {
+                                // Only forward frames that match the requested module
+                                if rx.module != module {
+                                    continue;
+                                }
+
+                                let resp = super::kaonic::ReceiveResponse {
+                                    module: rx.module as i32,
+                                    frame: Some(encode_frame(rx.frame.as_slice())),
+                                    rssi: rx.rssi as i32,
+                                    latency: 0,
+                                };
+
+                                if tx.send(Ok(resp)).await.is_err() {
                                     break;
                                 }
                             }
-                            Err(_) => break, // channel closed/lagged
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                log::warn!("receive_stream: subscriber lagged, skipped {} messages", n);
+                                continue;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }
                     }
                 }
@@ -181,21 +193,18 @@ fn module_index(module: i32) -> Result<usize, Status> {
 }
 
 fn encode_frame(buffer: &[u8]) -> RadioFrame {
-    // Convert the packet bytes to a list of words
-    // TODO: Optimize dynamic allocation
-    let words = buffer
-        .chunks(4)
-        .map(|chunk| {
-            let mut work = 0u32;
-            let chunk = chunk.iter().as_slice();
+    let word_len = (buffer.len() + 3) / 4;
+    let mut words = vec![0u32; word_len];
 
-            for i in 0..chunk.len() {
-                work |= (chunk[i] as u32) << (i * 8);
-            }
-
-            work
-        })
-        .collect::<Vec<_>>();
+    // Copy bytes directly into words buffer (little-endian)
+    // SAFETY: u32 slice can receive bytes, we just need to handle length
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            buffer.as_ptr(),
+            words.as_mut_ptr() as *mut u8,
+            buffer.len(),
+        );
+    }
 
     RadioFrame {
         data: words,
@@ -203,43 +212,29 @@ fn encode_frame(buffer: &[u8]) -> RadioFrame {
     }
 }
 
-fn decode_frame(frame: &RadioFrame, output_frame: &mut Kaonic1SFrame) -> Result<(), KaonicError> {
-    if output_frame.capacity() < (frame.length as usize) {
+fn decode_frame(
+    frame: &RadioFrame,
+    output_frame: &mut controller::RadioFrame,
+) -> Result<(), KaonicError> {
+    let length = frame.length as usize;
+
+    if output_frame.capacity() < length {
         return Err(KaonicError::OutOfMemory);
     }
 
-    let length = frame.length as usize;
-    let mut index = 0usize;
-    for word in &frame.data {
-        for i in 0..4 {
-            let _ = output_frame.push_data(&[((word >> i * 8) & 0xFF) as u8]);
+    // Allocate buffer in output frame and copy directly from words (little-endian)
+    let dest = output_frame.clear().alloc_buffer(length);
 
-            index += 1;
-
-            if index >= length {
-                break;
-            }
-        }
-
-        if index >= length {
-            break;
-        }
+    // SAFETY: words can be read as bytes on little-endian systems
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            frame.data.as_ptr() as *const u8,
+            dest.as_mut_ptr(),
+            length,
+        );
     }
 
     Ok(())
-}
-
-fn to_receive_response(evt: ReceiveEvent) -> ReceiveResponse {
-    super::kaonic::ReceiveResponse {
-        module: evt.module as i32,
-        frame: Some(encode_frame(evt.frame.as_slice())),
-        rssi: evt.rssi as i32,
-        latency: evt.latency_ms,
-    }
-}
-
-fn internal_err<E: std::fmt::Display>(e: E) -> Status {
-    Status::internal(e.to_string())
 }
 
 fn phy_to_modulation(

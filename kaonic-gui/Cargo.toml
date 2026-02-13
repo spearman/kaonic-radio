@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
 
+[features]
+default = []
+machine-kaonic1s = ["kaonic-net/machine-kaonic1s"]
+machine-host = ["kaonic-net/machine-host"]
+
 [dependencies]
 # GUI
 imgui = "0.12"
@@ -32,11 +37,14 @@ sha2 = "0.10"
 reqwest = { version = "0.11", features = ["blocking", "multipart", "json"] }
 serde_json = "1.0"
 
+# Local crates
+kaonic-net = { path = "../kaonic-net/" }
+
 # File dialog
 rfd = "0.12"
 
-# Reticulum
-reticulum = { git = "https://github.com/BeechatNetworkSystemsLtd/reticulum-rs.git", package = "reticulum" }
+# CLI parsing
+clap = { version = "4.5", features = ["derive"] }
 
 [build-dependencies]
 tonic-build = "0.13.0"
