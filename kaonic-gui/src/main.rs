@@ -55,8 +55,7 @@ fn main() {
     let event_loop = EventLoop::new().expect("Failed to create event loop");
     let window_builder = WindowBuilder::new()
         .with_title("Kaonic Radio Control")
-        .with_inner_size(winit::dpi::LogicalSize::new(1200.0, 800.0))
-        .with_resizable(false);
+        .with_inner_size(winit::dpi::LogicalSize::new(1200.0, 800.0));
 
     // Create OpenGL context
     let template = ConfigTemplateBuilder::new()
@@ -66,16 +65,8 @@ fn main() {
     let display_builder = DisplayBuilder::new().with_window_builder(Some(window_builder));
 
     let (window, gl_config) = display_builder
-        .build(&event_loop, template, |configs| {
-            configs
-                .reduce(|accum, config| {
-                    if config.num_samples() > accum.num_samples() {
-                        config
-                    } else {
-                        accum
-                    }
-                })
-                .unwrap()
+        .build(&event_loop, template, |mut configs| {
+            configs.next().unwrap()
         })
         .expect("Failed to create window");
 
