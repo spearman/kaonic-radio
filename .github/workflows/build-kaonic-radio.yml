@@ -25,12 +25,12 @@ jobs:
           cd ./kaonic-iperf
           cargo build --release --target aarch64-apple-darwin --no-default-features --features machine-host
           cd ../kaonic-gui
-          cargo build --release --target aarch64-apple-darwin --no-default-features --features machine-host 
+          cargo build --release --target aarch64-apple-darwin 
 
       - name: Prepare macOS artifacts
         run: |
           mkdir -p deploy/macos
-          cp kaonic-iperf/target/aarch64-apple-darwin/release/kaonic-iperf deploy/macos/
+          cp target/aarch64-apple-darwin/release/kaonic-iperf deploy/macos/
           cp kaonic-gui/target/aarch64-apple-darwin/release/kaonic-gui deploy/macos/
           cp kaonic-iperf/kaonic-config.toml deploy/macos/
 
@@ -61,12 +61,12 @@ jobs:
           cd ./kaonic-iperf
           cargo build --release --target x86_64-unknown-linux-gnu --no-default-features --features machine-host
           cd ../kaonic-gui
-          cargo build --release --target x86_64-unknown-linux-gnu --no-default-features --features machine-host
+          cargo build --release --target x86_64-unknown-linux-gnu
 
       - name: Prepare Linux artifacts
         run: |
           mkdir -p deploy/linux
-          cp kaonic-iperf/target/x86_64-unknown-linux-gnu/release/kaonic-iperf deploy/linux/
+          cp target/x86_64-unknown-linux-gnu/release/kaonic-iperf deploy/linux/
           cp kaonic-gui/target/x86_64-unknown-linux-gnu/release/kaonic-gui deploy/linux/
           cp kaonic-iperf/kaonic-config.toml deploy/linux/
 
@@ -98,12 +98,12 @@ jobs:
           cd ./kaonic-iperf
           cargo build --release --target x86_64-pc-windows-gnu --no-default-features --features machine-host
           cd ../kaonic-gui
-          cargo build --release --target x86_64-pc-windows-gnu --no-default-features --features machine-host
+          cargo build --release --target x86_64-pc-windows-gnu
 
       - name: Prepare Windows artifacts
         run: |
           mkdir -p deploy/windows
-          cp kaonic-iperf/target/x86_64-pc-windows-gnu/release/kaonic-iperf.exe deploy/windows/
+          cp target/x86_64-pc-windows-gnu/release/kaonic-iperf.exe deploy/windows/
           cp kaonic-gui/target/x86_64-pc-windows-gnu/release/kaonic-gui.exe deploy/windows/
           cp kaonic-iperf/kaonic-config.toml deploy/windows/
           # Copy required DLLs
