@@ -53,6 +53,7 @@ pub struct TransmitModule {
 pub struct ReceiveModule {
     pub module: usize,
     pub frame: RadioFrame,
+    pub rssi: i8,
 }
 
 impl ReceiveModule {
@@ -60,13 +61,33 @@ impl ReceiveModule {
         Self {
             module: 0,
             frame: RadioFrame::new(),
+            rssi: 0,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GetInfoResponse {
     pub module_count: usize,
+    pub serial: String,
+    pub mtu: usize,
+    pub version: String,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct GetStatisticsRequest {
+    pub module: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct GetStatisticsResponse {
+    pub module: usize,
+    pub rx_packets: u64,
+    pub tx_packets: u64,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub rx_errors: u64,
+    pub tx_errors: u64,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -105,7 +126,7 @@ pub struct GetRadioConfigResponse {
 
 //***********************************************************************************************//
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Payload {
     Ping,
     Pong,
@@ -123,36 +144,13 @@ pub enum Payload {
     GetModulationResponse(GetModulationResponse),
     GetInfoRequest,
     GetInfoResponse(GetInfoResponse),
+    GetStatisticsRequest(GetStatisticsRequest),
+    GetStatisticsResponse(GetStatisticsResponse),
     NotImplemented,
     Error,
 }
 
-impl Payload {
-    pub fn check_match(&self, payload: &Payload) -> bool {
-        match self {
-            Payload::Ping => matches!(payload, Payload::Pong),
-            Payload::Pong => matches!(payload, Payload::Ping),
-            Payload::TransmitModuleRequest(_) => matches!(payload, Payload::TransmitModuleResponse),
-            Payload::TransmitModuleResponse => matches!(payload, Payload::TransmitModuleRequest(_)),
-            Payload::ReceiveModule(_) => false,
-            Payload::ScanRequest => false,
-            Payload::SetRadioConfigRequest(_) => matches!(payload, Payload::SetRadioConfigResponse),
-            Payload::SetRadioConfigResponse => matches!(payload, Payload::SetRadioConfigRequest(_)),
-            Payload::GetRadioConfigRequest(_) => matches!(payload, Payload::GetRadioConfigResponse(_)),
-            Payload::GetRadioConfigResponse(_) => matches!(payload, Payload::GetRadioConfigRequest(_)),
-            Payload::SetModulationRequest(_) => matches!(payload, Payload::SetModulationResponse),
-            Payload::SetModulationResponse => matches!(payload, Payload::SetModulationRequest(_)),
-            Payload::GetModulationRequest(_) => matches!(payload, Payload::GetModulationResponse(_)),
-            Payload::GetModulationResponse(_) => matches!(payload, Payload::GetModulationRequest(_)),
-            Payload::GetInfoRequest => matches!(payload, Payload::GetInfoResponse(_)),
-            Payload::GetInfoResponse(_) => matches!(payload, Payload::GetInfoRequest),
-            Payload::NotImplemented => false,
-            Payload::Error => false,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Message {
     // should be equal to CTRL_PATTERN
     pub pattern: u16,

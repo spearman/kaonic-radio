@@ -1,8 +1,7 @@
 [package]
 name = "kaonic-commd"
-version = "0.1.0"
-edition = "2021"
-rust-version = "1.75"
+version = "0.2.0"
+edition = "2024"
 
 [features]
 default = ["machine-kaonic1s"]
@@ -16,6 +15,7 @@ machine-host = ["kaonic-radio/machine-host"]
 radio-rf215 = { path="../radio-rf215/" }
 kaonic-radio = { path="../kaonic-radio/", default-features = false }
 kaonic-ctrl = { path="../kaonic-ctrl/", default-features = false }
+radio-common = { path="../radio-common/" }
 
 rand = { version = "=0.8.5" }
 
