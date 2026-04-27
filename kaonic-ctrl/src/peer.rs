@@ -1,5 +1,9 @@
 use core::fmt;
-use std::{collections::HashMap, net::SocketAddr, time::{Duration, Instant}};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
 
 use kaonic_frame::frame::{Frame, FrameSegment};
 use kaonic_net::{packet::AssembledPacket, request::Responder};
@@ -119,11 +123,11 @@ pub struct Peer<
 }
 
 impl<
-        T: PeerMessage + std::fmt::Debug,
-        const MTU: usize,
-        const R: usize,
-        C: PeerCoder<T, MTU, R> + std::fmt::Debug,
-    > Peer<T, MTU, R, C>
+    T: PeerMessage + std::fmt::Debug,
+    const MTU: usize,
+    const R: usize,
+    C: PeerCoder<T, MTU, R> + std::fmt::Debug,
+> Peer<T, MTU, R, C>
 {
     pub fn new(socket: UdpSocket, coder: C, filter_rx_addr: Option<SocketAddr>) -> Self {
         let (tx_send, tx_recv) = mpsc::channel(128);
@@ -183,12 +187,16 @@ impl<
                             if addr != local_addr && (self.filter_rx_addr.is_some_and(|a| a == addr) || self.filter_rx_addr.is_none()) {
 
                                 clients.insert(addr, Instant::now());
+
                                 recv_frame.resize(len);
 
                                 if let Ok(packet) = self.network.receive(&recv_frame, &mut self.rx_frame) {
                                     if let Ok(message) = self.coder.deserialize(&packet) {
                                         if let Err(_) = self.rx_send.send(PeerRx { time: Instant::now(), addr, message: Box::new(message) }) {
+                                            log::error!("can't send rx packet");
                                         }
+                                    } else {
+                                        log::error!("can't decode packet");
                                     }
                                 }
                             }
@@ -203,18 +211,17 @@ impl<
                 Some(tx) = self.tx_recv.recv() => {
                     match self.coder.serialize(&tx.message, &mut self.tx_frame) {
                         Ok(_) => {
-
-
                             // Split messages into segment frames
                             let segments = self.network.transmit(self.tx_frame.as_slice(), rng, &mut self.frames);
 
                             if let Ok(segments) = segments {
-                                let mut total_bytes = 0usize;
+                                let mut _total_bytes = 0usize;
                                 for segment in segments.iter() {
 
-                                    total_bytes += segment.len();
+                                    _total_bytes += segment.len();
 
                                     if let Some(addr) = tx.addr {
+                                        log::trace!("send to client {}", addr);
                                         if let Err(_) = self.socket.send_to(segment.as_slice(), &addr).await {
                                             log::error!("socket send error");
                                         }
@@ -228,7 +235,7 @@ impl<
                                     }
                                 }
 
-                                // log::trace!("tx message time {} usec, {} bytes", tx.time.elapsed().as_micros(), total_bytes);
+                                // log::trace!("tx message time {} usec, {} bytes", tx.time.elapsed().as_micros(), _total_bytes);
 
                             } else {
                                 log::error!("segments were not created");

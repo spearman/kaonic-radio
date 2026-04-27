@@ -1,10 +1,10 @@
 use std::{net::SocketAddr, sync::Arc, time::Instant};
 
 use kaonic_net::request::RequestQueue;
-use rand::{rngs::OsRng, RngCore};
+use rand::{RngCore, rngs::OsRng};
 use tokio::{
     net::UdpSocket,
-    sync::{broadcast, mpsc, oneshot, Mutex},
+    sync::{Mutex, broadcast, mpsc, oneshot},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -80,6 +80,31 @@ impl<T: PeerMessage + Send + std::fmt::Debug + 'static> Client<T> {
         self.rx_send.subscribe()
     }
 
+    pub fn tx_sender(&self) -> PeerSender<T> {
+        self.tx_send.clone()
+    }
+
+    pub fn server_addr(&self) -> SocketAddr {
+        self.server_addr
+    }
+
+    async fn send_to_server(&self, message: T) -> Result<(), ControllerError> {
+        if let Err(_) = self
+            .tx_send
+            .send(PeerTx {
+                time: Instant::now(),
+                addr: Some(self.server_addr),
+                message: Box::new(message),
+            })
+            .await
+        {
+            log::error!("can't send message");
+            return Err(ControllerError::SocketError);
+        }
+
+        Ok(())
+    }
+
     pub async fn request(
         &mut self,
         message: T,
@@ -94,18 +119,7 @@ impl<T: PeerMessage + Send + std::fmt::Debug + 'static> Client<T> {
             AsyncResponder::new(res_send),
         )?;
 
-        if let Err(_) = self
-            .tx_send
-            .send(PeerTx {
-                time: Instant::now(),
-                addr: Some(self.server_addr),
-                message: Box::new(message),
-            })
-            .await
-        {
-            log::error!("can't send message");
-            return Err(ControllerError::SocketError);
-        }
+        self.send_to_server(message).await?;
 
         let start_time = Instant::now();
         let message = AsyncRequest::new(res_recv, timeout).response().await?;
