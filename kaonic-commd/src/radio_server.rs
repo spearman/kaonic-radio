@@ -304,9 +304,11 @@ impl ServerHandler<Message> for RadioServer {
                     let mut radio = self.radios[tx.module].lock().unwrap();
                     let frame_len = tx.frame.as_slice().len() as u64;
 
+                    let start = Instant::now();
                     if let Ok(_) =
                         radio.transmit(&PlatformRadioFrame::new_from_slice(tx.frame.as_slice()))
                     {
+                        log::info!("radio.transmit ok {}", start.elapsed().as_nanos());
                         self.stats[tx.module]
                             .tx_packets
                             .fetch_add(1, Ordering::Relaxed);
@@ -316,6 +318,7 @@ impl ServerHandler<Message> for RadioServer {
                         let _ = self.module_tx_send.send(Box::new(tx));
                         response.payload = Payload::TransmitModuleResponse;
                     } else {
+                        log::info!("radio.transmit error {}", start.elapsed().as_nanos());
                         self.stats[tx.module]
                             .tx_errors
                             .fetch_add(1, Ordering::Relaxed);
