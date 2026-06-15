@@ -177,27 +177,33 @@ async fn run_server(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
     let mut crc_errors: u64 = 0;
     let mut bytes_received: u64 = 0;
     let mut start_time: Option<Instant> = None;
+    let mut received_seqs = vec![];
 
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
 
+    let t_start = Instant::now();
     loop {
+        let ts = Instant::now();
         tokio::select! {
             _ = &mut shutdown => {
                 println!("\nShutting down...");
                 break;
             }
             result = module_rx.recv() => {
+                let now = Instant::now();
                 match result {
                     Ok(rx_module) => {
                         if rx_module.module != cfg.iperf.module {
                             continue;
                         }
+                        eprintln!("{} module_rx.recv {}", (now - t_start).as_nanos(), (now - ts).as_nanos());
 
                         let rx_data = rx_module.frame.as_slice();
 
                         match parse_packet(rx_data) {
                             Ok((seq, _ts)) => {
+                                received_seqs.push(seq);
                                 // Track receive stats
                                 let packet_size = rx_data.len() as u64;
                                 println!("[RX] seq={} size={} bytes", seq, packet_size);
@@ -222,7 +228,14 @@ async fn run_server(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
                                 let mut echo_frame = Frame::<2048>::new();
                                 echo_frame.copy_from_slice(rx_data);
 
-                                match radio_client.transmit(cfg.iperf.module, &echo_frame).await {
+                                let ts = Instant::now();
+                                let result = timeout(
+                                    Duration::from_millis(cfg.iperf.timeout),
+                                    radio_client.transmit(cfg.iperf.module, &echo_frame)
+                                ).await;
+                                let now = Instant::now();
+                                eprintln!("{} radio_client.transmit {}", (now - t_start).as_nanos(), (now - ts).as_nanos());
+                                match result {
                                     Ok(_) => {
                                         count += 1;
                                         println!(
@@ -258,6 +271,9 @@ async fn run_server(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
     }
 
     radio_client.cancel();
+
+    println!("{} / {} received ({:.1}%)", received_seqs.len(), received_seqs.last().unwrap(),
+        (received_seqs.len() as f64 / *received_seqs.last().unwrap() as f64) * 100.0);
 
     println!("\nTotal packets echoed: {}", count);
     if ignored > 0 {
@@ -349,18 +365,27 @@ async fn run_client(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
     // Pre-allocate reusable packet frame
     let mut tx_frame = Frame::<2048>::new();
 
+    let t_start = Instant::now();
     while start.elapsed() < test_duration {
         // Send request packet
         fill_packet(&mut tx_frame, seq, packet_size);
         let send_time = Instant::now();
 
-        if let Err(e) = radio_client.transmit(cfg.iperf.module, &tx_frame).await {
+        let ts = Instant::now();
+        let result = timeout(
+            Duration::from_millis(cfg.iperf.timeout),
+            radio_client.transmit(cfg.iperf.module, &tx_frame)
+        ).await;
+        let now = Instant::now();
+        eprintln!("{} radio_client.transmit {}", (now - t_start).as_nanos(), (now - ts).as_nanos());
+        if let Err(e) = result {
             error!("Transmit error: {:?}", e);
             seq = seq.wrapping_add(1);
             continue;
         }
 
         // Wait for response
+        let ts = Instant::now();
         loop {
             match timeout(Duration::from_millis(RESPONSE_TIMEOUT_MS), module_rx.recv()).await {
                 Ok(Ok(rx_module)) => {
@@ -404,6 +429,8 @@ async fn run_client(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
                     timeouts += 1;
                 }
             }
+            let now = Instant::now();
+            eprintln!("{} module_rx.recv {}", (now - t_start).as_nanos(), (now - ts).as_nanos());
             break
         }
 
