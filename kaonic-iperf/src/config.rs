@@ -21,6 +21,8 @@ pub struct IperfConfig {
     pub window: usize,
     /// One-way test: the client streams packets and the server only counts them.
     pub tx_only: bool,
+    /// Round-trip mode: how long to wait for each echo before counting it lost.
+    pub response_timeout_ms: u64,
 }
 
 impl Default for IperfConfig {
@@ -33,6 +35,7 @@ impl Default for IperfConfig {
             module: 0,
             window: 1,
             tx_only: false,
+            response_timeout_ms: 200,
         }
     }
 }
@@ -60,6 +63,7 @@ struct IperfPartial {
     module: Option<i64>,
     window: Option<usize>,
     tx_only: Option<bool>,
+    response_timeout_ms: Option<u64>,
 }
 
 /// Loads configuration from the given TOML file path and maps radio-* sections to protobufs.
@@ -143,6 +147,9 @@ pub fn load_config(path: &str) -> Result<Config, Box<dyn Error>> {
             }
             if let Some(b) = partial.tx_only {
                 d.tx_only = b;
+            }
+            if let Some(ms) = partial.response_timeout_ms {
+                d.response_timeout_ms = ms.max(1);
             }
         }
         d

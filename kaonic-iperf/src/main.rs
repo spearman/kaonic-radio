@@ -13,7 +13,6 @@ mod config;
 const DEFAULT_COMMD_ADDR: &str = "192.168.10.1:9090";
 const MIN_PACKET_SIZE: usize = 24; // MAGIC(4) + SEQ(4) + TIMESTAMP(8) + padding(4) + CRC(4)
 const MAX_PACKET_SIZE: usize = 2048;
-const RESPONSE_TIMEOUT_MS: u64 = 500;
 
 #[derive(Parser, Debug)]
 #[command(name = "kaonic-iperf")]
@@ -468,6 +467,7 @@ async fn run_client(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
 
     println!("Packet size: {} bytes", packet_size);
     println!("Window: {} packet(s)", window);
+    println!("Response timeout: {} ms", cfg.iperf.response_timeout_ms);
     println!("Duration: {} seconds\n", cfg.iperf.duration);
 
     // Start receive stream
@@ -475,7 +475,7 @@ async fn run_client(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
 
     let start = Instant::now();
     let test_duration = Duration::from_secs(cfg.iperf.duration);
-    let response_timeout = Duration::from_millis(RESPONSE_TIMEOUT_MS);
+    let response_timeout = Duration::from_millis(cfg.iperf.response_timeout_ms);
     let mut seq: u32 = 0;
     let mut rtt_min: u64 = u64::MAX;
     let mut rtt_max: u64 = 0;
