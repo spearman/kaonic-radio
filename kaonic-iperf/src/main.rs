@@ -175,6 +175,7 @@ async fn run_server(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
     let mut crc_errors: u64 = 0;
     let mut bytes_received: u64 = 0;
     let mut start_time: Option<Instant> = None;
+    let mut last_rx_time: Option<Instant> = None;
 
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
@@ -199,9 +200,11 @@ async fn run_server(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
                                 // Track receive stats
                                 let packet_size = rx_data.len() as u64;
                                 println!("[RX] seq={} size={} bytes", seq, packet_size);
+                                let now = Instant::now();
                                 if start_time.is_none() {
-                                    start_time = Some(Instant::now());
+                                    start_time = Some(now);
                                 }
+                                last_rx_time = Some(now);
                                 bytes_received += packet_size;
 
                                 // Calculate current receive speed
@@ -264,8 +267,8 @@ async fn run_server(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
     if crc_errors > 0 {
         println!("CRC errors: {}", crc_errors);
     }
-    if let Some(start) = start_time {
-        let elapsed = start.elapsed().as_secs_f64();
+    if let (Some(start), Some(last)) = (start_time, last_rx_time) {
+        let elapsed = last.duration_since(start).as_secs_f64();
         if elapsed > 0.0 {
             let avg_speed_kbps = (bytes_received as f64 * 8.0) / elapsed / 1000.0;
             println!("Bytes received: {}", bytes_received);
