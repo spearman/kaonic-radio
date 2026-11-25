@@ -45,6 +45,14 @@ fn compute_crc(data: &[u8]) -> u32 {
     kaonic_crc::crc32(data)
 }
 
+fn per_sec(n: u64, secs: f64) -> f64 {
+    if secs > 0.0 {
+        n as f64 / secs
+    } else {
+        0.0
+    }
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -174,6 +182,7 @@ async fn run_server(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
     let mut ignored: u64 = 0;
     let mut crc_errors: u64 = 0;
     let mut bytes_received: u64 = 0;
+    let mut rx_packets: u64 = 0;
     let mut start_time: Option<Instant> = None;
     let mut last_rx_time: Option<Instant> = None;
 
@@ -218,18 +227,14 @@ async fn run_server(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
                                 }
                                 last_rx_time = Some(now);
                                 bytes_received += packet_size;
+                                rx_packets += 1;
 
-                                // Calculate current receive speed
-                                let speed_kbps = start_time
-                                    .map(|t| {
-                                        let elapsed = t.elapsed().as_secs_f64();
-                                        if elapsed > 0.0 {
-                                            (bytes_received as f64 * 8.0) / elapsed / 1000.0
-                                        } else {
-                                            0.0
-                                        }
-                                    })
+                                // Calculate current receive speed and packet rate
+                                let elapsed = start_time
+                                    .map(|t| t.elapsed().as_secs_f64())
                                     .unwrap_or(0.0);
+                                let speed_kbps = per_sec(bytes_received * 8, elapsed) / 1000.0;
+                                let pkt_rate = per_sec(rx_packets, elapsed);
 
                                 if tx_only {
                                     count += 1;
@@ -238,8 +243,8 @@ async fn run_server(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
                                     }
                                     max_seq = Some(max_seq.map_or(seq, |m| m.max(seq)));
                                     println!(
-                                        "[{}] RX seq={} size={}  rx={:.2} kb/s",
-                                        count, seq, rx_data.len(), speed_kbps
+                                        "[{}] RX seq={} size={}  rx={:.2} kb/s  {:.1} pkt/s",
+                                        count, seq, rx_data.len(), speed_kbps, pkt_rate
                                     );
                                     continue;
                                 }
@@ -252,8 +257,8 @@ async fn run_server(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
                                     Ok(_) => {
                                         count += 1;
                                         println!(
-                                            "[{}] Echo seq={} size={}  rx={:.2} kb/s",
-                                            count, seq, rx_data.len(), speed_kbps
+                                            "[{}] Echo seq={} size={}  rx={:.2} kb/s  {:.1} pkt/s",
+                                            count, seq, rx_data.len(), speed_kbps, pkt_rate
                                         );
                                     }
                                     Err(e) => warn!("Transmit error: {:?}", e),
@@ -318,6 +323,10 @@ async fn run_server(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
             let avg_speed_kbps = (bytes_received as f64 * 8.0) / elapsed / 1000.0;
             println!("Bytes received: {}", bytes_received);
             println!("Avg receive speed: {:.2} kb/s", avg_speed_kbps);
+            println!(
+                "Avg receive rate: {:.1} pkt/s",
+                per_sec(rx_packets, elapsed)
+            );
         }
     }
     Ok(())
@@ -367,11 +376,12 @@ async fn run_client_tx_only(
         if elapsed >= next_progress {
             let secs = elapsed.as_secs_f64();
             println!(
-                "[{:>5.1} s] sent={}  tx_errors={}  offered={:.1} kb/s",
+                "[{:>5.1} s] sent={}  tx_errors={}  offered={:.1} kb/s  {:.1} pkt/s",
                 secs,
                 sent,
                 tx_errors,
-                offered_kbps(sent, secs)
+                offered_kbps(sent, secs),
+                per_sec(sent, secs)
             );
             next_progress += progress_interval;
         }
@@ -387,6 +397,7 @@ async fn run_client_tx_only(
         println!("Last seq:     {}", seq - 1);
     }
     println!("Offered:      {:.2} kb/s", offered_kbps(sent, elapsed));
+    println!("Packet rate:  {:.1} pkt/s", per_sec(sent, elapsed));
 
     Ok(())
 }
@@ -606,6 +617,11 @@ async fn run_client(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
     if elapsed > 0.0 {
         let speed_kbps = (bytes_transferred as f64 * 8.0) / elapsed / 1000.0;
         println!("Speed:        {:.2} kb/s", speed_kbps);
+        println!(
+            "Rate:         {:.1} round trips/s ({:.1} pkt/s sent)",
+            per_sec(rtt_count, elapsed),
+            per_sec(packets_sent, elapsed)
+        );
     }
 
     if packets_sent > 0 {
