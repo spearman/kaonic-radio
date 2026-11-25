@@ -3,7 +3,7 @@ use std::time::Instant;
 use kaonic_ctrl::protocol::{ReceiveModule, TransmitModule};
 use kaonic_radio::{platform::PlatformRadioFrame, radio::Radio};
 use radio_common::{
-    RadioConfig,
+    Accelerator, Antenna, RadioBand, RadioConfig,
     frequency::{BandwidthFilter, Hertz},
     modulation::{
         Modulation, OfdmBandwidthOption, OfdmMcs, OfdmModulation, QpskChipFrequency,
@@ -24,11 +24,14 @@ pub use kaonic::device_server::DeviceServer;
 pub use kaonic::radio_server::RadioServer as GrpcRadioServer;
 
 use kaonic::{
-    Empty, InfoResponse, ModuleRequest, RadioConfig as ProtoRadioConfig, RadioFrame as ProtoFrame,
-    RadioModulation, RadioModulationFsk, RadioModulationOfdm, RadioModulationQpsk, ReceiveRequest,
-    ReceiveResponse, StatisticsResponse, TransmitEventRequest, TransmitEventResponse,
-    TransmitRequest, TransmitResponse, device_server::Device,
-    radio_modulation::Modulation as ProtoModulation, radio_server::Radio as RadioTrait,
+    Acceleration as ProtoAcceleration, Antenna as ProtoAntenna, AntennaRequest, Empty,
+    InfoResponse, ModuleRequest, RadioAcceleration, RadioAntenna, RadioBand as ProtoRadioBand,
+    RadioConfig as ProtoRadioConfig, RadioBandRange, RadioFilter, RadioFilterSelect, RadioFilters,
+    RadioFrame as ProtoFrame, RadioModulation,
+    RadioModulationFsk, RadioModulationOfdm, RadioModulationQpsk, ReceiveRequest, ReceiveResponse,
+    StatisticsResponse, TransmitEventRequest, TransmitEventResponse, TransmitRequest,
+    TransmitResponse, device_server::Device, radio_modulation::Modulation as ProtoModulation,
+    radio_server::Radio as RadioTrait,
 };
 
 //***********************************************************************************************//
@@ -133,12 +136,55 @@ fn qpsk_mode_to_u32(mode: &QpskRateMode) -> u32 {
     }
 }
 
+fn acceleration_from_proto(v: i32) -> Accelerator {
+    match ProtoAcceleration::try_from(v) {
+        Ok(ProtoAcceleration::Hardware) => Accelerator::Hardware,
+        _ => Accelerator::Native,
+    }
+}
+
+fn acceleration_to_proto(accelerator: &Accelerator) -> i32 {
+    match accelerator {
+        Accelerator::Native => ProtoAcceleration::Native as i32,
+        Accelerator::Hardware => ProtoAcceleration::Hardware as i32,
+    }
+}
+
+fn band_from_proto(v: i32) -> RadioBand {
+    match ProtoRadioBand::try_from(v) {
+        Ok(ProtoRadioBand::Band24) => RadioBand::Band24,
+        _ => RadioBand::Band09,
+    }
+}
+
+fn band_to_proto(band: &RadioBand) -> i32 {
+    match band {
+        RadioBand::Band09 => ProtoRadioBand::Band09 as i32,
+        RadioBand::Band24 => ProtoRadioBand::Band24 as i32,
+    }
+}
+
+fn antenna_from_proto(v: i32) -> Antenna {
+    match ProtoAntenna::try_from(v) {
+        Ok(ProtoAntenna::External) => Antenna::External,
+        _ => Antenna::Internal,
+    }
+}
+
+fn antenna_to_proto(antenna: &Antenna) -> i32 {
+    match antenna {
+        Antenna::Internal => ProtoAntenna::Internal as i32,
+        Antenna::External => ProtoAntenna::External as i32,
+    }
+}
+
 fn modulation_to_proto(module: i32, modulation: &Modulation) -> RadioModulation {
     let variant = match modulation {
         Modulation::Ofdm(o) => Some(ProtoModulation::Ofdm(RadioModulationOfdm {
             mcs: ofdm_mcs_to_u32(&o.mcs),
             opt: ofdm_opt_to_u32(&o.opt),
-            pdt: o.pdt as u32,
+            // PDT is derived from the bandwidth option; report the value actually used.
+            pdt: o.opt.recommended_pdt() as u32,
             tx_power: o.tx_power as u32,
         })),
         Modulation::Qpsk(q) => Some(ProtoModulation::Qpsk(RadioModulationQpsk {
@@ -160,7 +206,7 @@ fn modulation_from_proto(req: &RadioModulation) -> Modulation {
         Some(ProtoModulation::Ofdm(o)) => Modulation::Ofdm(OfdmModulation {
             mcs: ofdm_mcs_from_u32(o.mcs),
             opt: ofdm_opt_from_u32(o.opt),
-            pdt: o.pdt as u8,
+            // PDT is no longer a user parameter; it is derived from the bandwidth option.
             tx_power: o.tx_power as u8,
         }),
         Some(ProtoModulation::Qpsk(q)) => Modulation::Qpsk(QpskModulation {
@@ -354,6 +400,134 @@ impl RadioTrait for RadioService {
             .unwrap()
             .set_modulation(&modulation)
             .map_err(|e| Status::internal(format!("set_modulation: {:?}", e)))?;
+        Ok(Response::new(Empty {}))
+    }
+
+    // ── GetAcceleration ───────────────────────────────────────────────────────
+
+    async fn get_acceleration(
+        &self,
+        request: Request<ModuleRequest>,
+    ) -> Result<Response<RadioAcceleration>, Status> {
+        let module = request.into_inner().module;
+        let idx = self.module_index(module)?;
+        let accelerator = self.radios[idx].lock().unwrap().get_accelerator();
+        Ok(Response::new(RadioAcceleration {
+            module,
+            acceleration: acceleration_to_proto(&accelerator),
+        }))
+    }
+
+    // ── SetAcceleration ───────────────────────────────────────────────────────
+
+    async fn set_acceleration(
+        &self,
+        request: Request<RadioAcceleration>,
+    ) -> Result<Response<Empty>, Status> {
+        let req = request.into_inner();
+        let idx = self.module_index(req.module)?;
+        let accelerator = acceleration_from_proto(req.acceleration);
+        self.radios[idx]
+            .lock()
+            .unwrap()
+            .set_accelerator(&accelerator)
+            .map_err(|e| Status::internal(format!("set_acceleration: {:?}", e)))?;
+        Ok(Response::new(Empty {}))
+    }
+
+    // ── GetAntenna ────────────────────────────────────────────────────────────
+
+    async fn get_antenna(
+        &self,
+        request: Request<AntennaRequest>,
+    ) -> Result<Response<RadioAntenna>, Status> {
+        let req = request.into_inner();
+        let idx = self.module_index(req.module)?;
+        let band = band_from_proto(req.band);
+        let antenna = self.radios[idx].lock().unwrap().get_antenna(band);
+        Ok(Response::new(RadioAntenna {
+            module: req.module,
+            band: req.band,
+            antenna: antenna_to_proto(&antenna),
+        }))
+    }
+
+    // ── SetAntenna ────────────────────────────────────────────────────────────
+
+    async fn set_antenna(
+        &self,
+        request: Request<RadioAntenna>,
+    ) -> Result<Response<Empty>, Status> {
+        let req = request.into_inner();
+        let idx = self.module_index(req.module)?;
+        let band = band_from_proto(req.band);
+        let antenna = antenna_from_proto(req.antenna);
+        self.radios[idx]
+            .lock()
+            .unwrap()
+            .set_antenna(band, antenna)
+            .map_err(|e| Status::internal(format!("set_antenna: {:?}", e)))?;
+        Ok(Response::new(Empty {}))
+    }
+
+    // ── GetFilters ────────────────────────────────────────────────────────────
+
+    async fn get_filters(
+        &self,
+        request: Request<ModuleRequest>,
+    ) -> Result<Response<RadioFilters>, Status> {
+        let req = request.into_inner();
+        let idx = self.module_index(req.module)?;
+        let (state, ranges) = {
+            let radio = self.radios[idx].lock().unwrap();
+            (radio.get_filter(), radio.band_ranges())
+        };
+        Ok(Response::new(RadioFilters {
+            module: req.module,
+            filters: state
+                .filters
+                .iter()
+                .map(|filter| RadioFilter {
+                    label: filter.label.to_string(),
+                    min_khz: filter.min_khz,
+                    max_khz: filter.max_khz,
+                })
+                .collect(),
+            selected: state.selected.map(u32::from),
+            active: state.active.map(u32::from),
+            ranges: [(RadioBand::Band09, ranges.sub_ghz), (RadioBand::Band24, ranges.band_24)]
+                .into_iter()
+                .filter_map(|(band, range)| {
+                    range.map(|range| RadioBandRange {
+                        band: band_to_proto(&band),
+                        min_khz: range.min_khz,
+                        max_khz: range.max_khz,
+                    })
+                })
+                .collect(),
+        }))
+    }
+
+    // ── SetFilter ─────────────────────────────────────────────────────────────
+
+    async fn set_filter(
+        &self,
+        request: Request<RadioFilterSelect>,
+    ) -> Result<Response<Empty>, Status> {
+        let req = request.into_inner();
+        let idx = self.module_index(req.module)?;
+        let filter = match req.filter {
+            Some(index) => Some(
+                u8::try_from(index)
+                    .map_err(|_| Status::invalid_argument("set_filter: no such filter"))?,
+            ),
+            None => None,
+        };
+        self.radios[idx]
+            .lock()
+            .unwrap()
+            .set_filter(filter)
+            .map_err(|e| Status::invalid_argument(format!("set_filter: {:?}", e)))?;
         Ok(Response::new(Empty {}))
     }
 

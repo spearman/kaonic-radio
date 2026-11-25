@@ -2,7 +2,7 @@ use std::{net::SocketAddr, time::Duration};
 
 use kaonic_frame::frame::Frame;
 use rand::rngs::OsRng;
-use radio_common::{Modulation, RadioConfig};
+use radio_common::{Accelerator, Antenna, Modulation, RadioBand, RadioConfig};
 use tokio::sync::{broadcast, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -196,6 +196,125 @@ impl RadioClient {
         .await?;
 
         Ok(())
+    }
+
+    /// Sets the acceleration mode (native baseband vs FPGA hardware) for the specified module.
+    pub async fn set_accelerator(
+        &mut self,
+        module: usize,
+        acceleration: Accelerator,
+    ) -> Result<(), ControllerError> {
+        let response = self
+            .request(Payload::SetAccelerationRequest(
+                crate::protocol::SetAccelerationRequest {
+                    module,
+                    acceleration,
+                },
+            ))
+            .await?;
+
+        match response.payload {
+            Payload::Error => Err(ControllerError::MethodError),
+            Payload::SetAccelerationResponse => Ok(()),
+            _ => Err(ControllerError::DecodeError),
+        }
+    }
+
+    /// Retrieves the current acceleration mode of the specified radio module.
+    pub async fn get_accelerator(&mut self, module: usize) -> Result<Accelerator, ControllerError> {
+        let response = self
+            .request(Payload::GetAccelerationRequest(
+                crate::protocol::GetAccelerationRequest { module },
+            ))
+            .await?;
+
+        match response.payload {
+            Payload::Error => Err(ControllerError::MethodError),
+            Payload::GetAccelerationResponse(r) => Ok(r.acceleration),
+            _ => Err(ControllerError::DecodeError),
+        }
+    }
+
+    /// Selects the antenna (internal or external) for the given band of the specified module.
+    pub async fn set_antenna(
+        &mut self,
+        module: usize,
+        band: RadioBand,
+        antenna: Antenna,
+    ) -> Result<(), ControllerError> {
+        let response = self
+            .request(Payload::SetAntennaRequest(
+                crate::protocol::SetAntennaRequest {
+                    module,
+                    band,
+                    antenna,
+                },
+            ))
+            .await?;
+
+        match response.payload {
+            Payload::Error => Err(ControllerError::MethodError),
+            Payload::SetAntennaResponse => Ok(()),
+            _ => Err(ControllerError::DecodeError),
+        }
+    }
+
+    /// The module's sub-GHz filters, the selection (`None` is auto) and the
+    /// filter in use.
+    pub async fn get_filters(
+        &mut self,
+        module: usize,
+    ) -> Result<crate::protocol::GetFiltersResponse, ControllerError> {
+        let response = self
+            .request(Payload::GetFiltersRequest(
+                crate::protocol::GetFiltersRequest { module },
+            ))
+            .await?;
+
+        match response.payload {
+            Payload::Error => Err(ControllerError::MethodError),
+            Payload::GetFiltersResponse(filters) => Ok(filters),
+            _ => Err(ControllerError::DecodeError),
+        }
+    }
+
+    /// Selects a sub-GHz filter by index, or `None` for auto.
+    pub async fn set_filter(
+        &mut self,
+        module: usize,
+        filter: Option<u8>,
+    ) -> Result<(), ControllerError> {
+        let response = self
+            .request(Payload::SetFilterRequest(crate::protocol::SetFilterRequest {
+                module,
+                filter,
+            }))
+            .await?;
+
+        match response.payload {
+            Payload::Error => Err(ControllerError::MethodError),
+            Payload::SetFilterResponse => Ok(()),
+            _ => Err(ControllerError::DecodeError),
+        }
+    }
+
+    /// Retrieves the currently selected antenna for the given band of the specified module.
+    pub async fn get_antenna(
+        &mut self,
+        module: usize,
+        band: RadioBand,
+    ) -> Result<Antenna, ControllerError> {
+        let response = self
+            .request(Payload::GetAntennaRequest(
+                crate::protocol::GetAntennaRequest { module, band },
+            ))
+            .await?;
+
+        match response.payload {
+            Payload::Error => Err(ControllerError::MethodError),
+            Payload::GetAntennaResponse(r) => Ok(r.antenna),
+            _ => Err(ControllerError::DecodeError),
+        }
     }
 
     /// Queries the device for general info (e.g. number of radio modules).
