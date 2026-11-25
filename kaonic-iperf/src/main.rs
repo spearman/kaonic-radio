@@ -121,8 +121,13 @@ fn parse_packet(data: &[u8]) -> Result<(u32, u64), ParseError> {
     Ok((seq, timestamp))
 }
 
-async fn run_server(address: &str, cfg: &config::Config) -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== Kaonic RTT Server ===");
+/// Opens the control connection to kaonic-commd, verifies that commd actually
+/// answers (UDP has no handshake, so creating the client proves nothing), and
+/// applies the radio configuration for the iperf module.
+async fn connect_and_configure(
+    address: &str,
+    cfg: &config::Config,
+) -> Result<RadioClient, Box<dyn std::error::Error>> {
     println!("Connecting to {}...", address);
 
     let server_addr: std::net::SocketAddr = address.parse()?;
@@ -142,7 +147,31 @@ async fn run_server(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
     let mut radio_client = RadioClient::new(client, cancel.clone())
         .await
         .map_err(|e| format!("RadioClient init error: {:?}", e))?;
-    println!("Connected.");
+
+    let info = radio_client.get_info().await.map_err(|e| {
+        format!(
+            "No response from kaonic-commd at {} ({:?}). Check that kaonic-commd is running \
+             on the board and listening on UDP {} (systemctl status kaonic-commd), and that \
+             replies come back from exactly {} (run with RUST_LOG=debug to see dropped packets)",
+            server_addr,
+            e,
+            server_addr.port(),
+            server_addr.ip()
+        )
+    })?;
+
+    println!(
+        "Connected to kaonic-commd v{} (serial {}, {} module(s), mtu {}).",
+        info.version, info.serial, info.module_count, info.mtu
+    );
+
+    if cfg.iperf.module >= info.module_count {
+        return Err(format!(
+            "iperf module {} does not exist on the board ({} module(s))",
+            cfg.iperf.module, info.module_count
+        )
+        .into());
+    }
 
     // Apply radio configuration for the target module only
     if let Some(radio_cfg) = cfg.radios.iter().find(|r| r.module == cfg.iperf.module) {
@@ -167,6 +196,14 @@ async fn run_server(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
             cfg.iperf.module
         );
     }
+
+    Ok(radio_client)
+}
+
+async fn run_server(address: &str, cfg: &config::Config) -> Result<(), Box<dyn std::error::Error>> {
+    println!("=== Kaonic RTT Server ===");
+
+    let mut radio_client = connect_and_configure(address, cfg).await?;
 
     let mut module_rx = radio_client.module_receive();
     let mut count: u64 = 0;
@@ -281,50 +318,8 @@ async fn run_client(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
         .clamp(MIN_PACKET_SIZE, MAX_PACKET_SIZE);
 
     println!("=== Kaonic RTT Client ===");
-    println!("Connecting to {}...", address);
 
-    let server_addr: std::net::SocketAddr = address.parse()?;
-    let listen_addr: std::net::SocketAddr = "0.0.0.0:0".parse()?;
-
-    let cancel = CancellationToken::new();
-
-    let client = Client::connect(
-        listen_addr,
-        server_addr,
-        MessageCoder::<1400, 5>::new(),
-        cancel.clone(),
-    )
-    .await
-    .map_err(|e| format!("Client connect error: {:?}", e))?;
-
-    let mut radio_client = RadioClient::new(client, cancel.clone())
-        .await
-        .map_err(|e| format!("RadioClient init error: {:?}", e))?;
-    println!("Connected.");
-
-    // Apply radio configuration for the target module only
-    if let Some(radio_cfg) = cfg.radios.iter().find(|r| r.module == cfg.iperf.module) {
-        println!("Configuring radio module {}...", cfg.iperf.module);
-        radio_client
-            .set_radio_config(cfg.iperf.module, radio_cfg.config.clone())
-            .await
-            .map_err(|e| format!("Config error: {:?}", e))?;
-
-        if let Some(modulation) = radio_cfg.modulation {
-            radio_client
-                .set_modulation(cfg.iperf.module, modulation)
-                .await
-                .map_err(|e| format!("Modulation error: {:?}", e))?;
-            println!("Modulation configured: {:?}", modulation);
-        }
-
-        println!("Radio configuration applied.");
-    } else {
-        println!(
-            "Warning: no radio config found for module {}",
-            cfg.iperf.module
-        );
-    }
+    let mut radio_client = connect_and_configure(address, cfg).await?;
 
     println!("Packet size: {} bytes", packet_size);
     println!("Duration: {} seconds\n", cfg.iperf.duration);

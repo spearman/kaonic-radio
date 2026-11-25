@@ -199,6 +199,13 @@ impl<
                                         log::error!("can't decode packet");
                                     }
                                 }
+                            } else if addr != local_addr {
+                                log::debug!(
+                                    "dropped {} byte datagram from {} (expected {:?})",
+                                    len,
+                                    addr,
+                                    self.filter_rx_addr
+                                );
                             }
                         }
                         Err(e) => {
