@@ -1,7 +1,7 @@
 use clap::Parser;
 use log::{error, warn};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::time::timeout;
+use tokio::{sync::broadcast, time::timeout_at};
 use tokio_util::sync::CancellationToken;
 
 use kaonic_ctrl::{client::Client, protocol::MessageCoder, radio::RadioClient};
@@ -357,9 +357,14 @@ async fn run_client(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
             continue;
         }
 
-        // Wait for response
+        // Wait for the echo of this seq until the deadline. Frames that are not
+        // that echo (other module, late echoes of earlier seqs, non-iperf
+        // traffic) are skipped without re-sending or restarting the timer.
+        let deadline = send_time + Duration::from_millis(RESPONSE_TIMEOUT_MS);
+        let mut channel_closed = false;
+
         loop {
-            match timeout(Duration::from_millis(RESPONSE_TIMEOUT_MS), module_rx.recv()).await {
+            match timeout_at(deadline.into(), module_rx.recv()).await {
                 Ok(Ok(rx_module)) => {
                     if rx_module.module != cfg.iperf.module {
                         continue;
@@ -369,16 +374,18 @@ async fn run_client(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
                     let rx_data = rx_module.frame.as_slice();
 
                     match parse_packet(rx_data) {
-                        Ok((resp_seq, _)) => {
-                            if resp_seq == seq {
-                                rtt_min = rtt_min.min(rtt);
-                                rtt_max = rtt_max.max(rtt);
-                                rtt_sum += rtt;
-                                rtt_count += 1;
-                                bytes_transferred += (packet_size * 2) as u64; // req + resp
+                        Ok((resp_seq, _)) if resp_seq == seq => {
+                            rtt_min = rtt_min.min(rtt);
+                            rtt_max = rtt_max.max(rtt);
+                            rtt_sum += rtt;
+                            rtt_count += 1;
+                            bytes_transferred += (packet_size * 2) as u64; // req + resp
 
-                                println!("seq={:<6} rtt={:<4} ms  size={}", seq, rtt, rx_data.len());
-                            }
+                            println!("seq={:<6} rtt={:<4} ms  size={}", seq, rtt, rx_data.len());
+                            break;
+                        }
+                        Ok(_) => {
+                            // Late echo of an earlier seq; keep waiting for ours
                         }
                         Err(ParseError::CrcMismatch { expected, actual }) => {
                             crc_errors += 1;
@@ -386,25 +393,35 @@ async fn run_client(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
                                 "seq={:<6} CRC ERROR (expected={:#010x} actual={:#010x})",
                                 seq, expected, actual
                             );
+                            break;
                         }
                         Err(_) => {
                             // Ignore non-iperf packets
                         }
                     }
                 }
-                Ok(Err(_)) => {
-                    // Channel error
+                Ok(Err(broadcast::error::RecvError::Lagged(skipped))) => {
+                    warn!("receive stream lagged by {} frames", skipped);
+                }
+                Ok(Err(broadcast::error::RecvError::Closed)) => {
                     timeouts += 1;
+                    channel_closed = true;
+                    break;
                 }
                 Err(_) => {
                     println!("seq={:<6} TIMEOUT", seq);
                     timeouts += 1;
+                    break;
                 }
             }
-            break
         }
 
         seq = seq.wrapping_add(1);
+
+        if channel_closed {
+            error!("receive stream closed, stopping test");
+            break;
+        }
     }
 
     radio_client.cancel();
