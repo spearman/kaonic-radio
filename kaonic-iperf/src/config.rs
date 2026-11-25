@@ -14,7 +14,6 @@ use std::fs;
 pub struct IperfConfig {
     pub duration: u64,
     pub payload_size: usize,
-    pub timeout: u64,
     pub ip: Option<String>,
     pub module: usize,
     /// Packets in flight in client round-trip mode (1 = stop-and-wait).
@@ -30,7 +29,6 @@ impl Default for IperfConfig {
         IperfConfig {
             duration: 10,
             payload_size: 2047,
-            timeout: 10,
             ip: None,
             module: 0,
             window: 1,
@@ -58,7 +56,6 @@ pub struct RadioConfigWithModule {
 struct IperfPartial {
     duration: Option<u64>,
     payload_size: Option<usize>,
-    timeout: Option<u64>,
     ip: Option<String>,
     module: Option<i64>,
     window: Option<usize>,
@@ -132,9 +129,6 @@ pub fn load_config(path: &str) -> Result<Config, Box<dyn Error>> {
             }
             if let Some(x) = partial.payload_size {
                 d.payload_size = x;
-            }
-            if let Some(x) = partial.timeout {
-                d.timeout = x;
             }
             if let Some(x) = partial.ip {
                 d.ip = Some(x);

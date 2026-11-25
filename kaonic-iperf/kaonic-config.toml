@@ -10,7 +10,6 @@
 module = 0
 duration = 10
 payload_size = 2047
-timeout = 10
 # Packets in flight in client round-trip mode (1 = stop-and-wait).
 window = 1
 # One-way test (must be set on both sides)
