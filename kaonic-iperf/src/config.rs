@@ -17,6 +17,8 @@ pub struct IperfConfig {
     pub timeout: u64,
     pub ip: Option<String>,
     pub module: usize,
+    /// Packets in flight in client round-trip mode (1 = stop-and-wait).
+    pub window: usize,
 }
 
 impl Default for IperfConfig {
@@ -27,6 +29,7 @@ impl Default for IperfConfig {
             timeout: 10,
             ip: None,
             module: 0,
+            window: 1,
         }
     }
 }
@@ -52,6 +55,7 @@ struct IperfPartial {
     timeout: Option<u64>,
     ip: Option<String>,
     module: Option<i64>,
+    window: Option<usize>,
 }
 
 /// Loads configuration from the given TOML file path and maps radio-* sections to protobufs.
@@ -129,6 +133,9 @@ pub fn load_config(path: &str) -> Result<Config, Box<dyn Error>> {
             }
             if let Some(m) = partial.module {
                 d.module = m as usize;
+            }
+            if let Some(w) = partial.window {
+                d.window = w.max(1);
             }
         }
         d

@@ -1,5 +1,6 @@
 use clap::Parser;
 use log::{error, warn};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::{sync::broadcast, time::timeout_at};
 use tokio_util::sync::CancellationToken;
@@ -326,7 +327,10 @@ async fn run_client(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
         );
     }
 
+    let window = cfg.iperf.window.max(1);
+
     println!("Packet size: {} bytes", packet_size);
+    println!("Window: {} packet(s)", window);
     println!("Duration: {} seconds\n", cfg.iperf.duration);
 
     // Start receive stream
@@ -334,6 +338,7 @@ async fn run_client(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
 
     let start = Instant::now();
     let test_duration = Duration::from_secs(cfg.iperf.duration);
+    let response_timeout = Duration::from_millis(RESPONSE_TIMEOUT_MS);
     let mut seq: u32 = 0;
     let mut rtt_min: u64 = u64::MAX;
     let mut rtt_max: u64 = 0;
@@ -342,85 +347,107 @@ async fn run_client(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
     let mut bytes_transferred: u64 = 0;
     let mut timeouts: u64 = 0;
     let mut crc_errors: u64 = 0;
+    let mut tx_errors: u64 = 0;
+
+    // Packets awaiting their echo, oldest first: (seq, send time)
+    let mut in_flight: VecDeque<(u32, Instant)> = VecDeque::with_capacity(window);
 
     // Pre-allocate reusable packet frame
     let mut tx_frame = Frame::<2048>::new();
 
-    while start.elapsed() < test_duration {
-        // Send request packet
-        fill_packet(&mut tx_frame, seq, packet_size);
-        let send_time = Instant::now();
+    // Keep up to `window` packets in flight until the test duration is over,
+    // then drain the remaining echoes. Each packet has its own deadline;
+    // frames that are not an in-flight echo (other module, late echoes,
+    // non-iperf traffic) are skipped without re-sending or extending it.
+    loop {
+        while in_flight.len() < window && start.elapsed() < test_duration {
+            fill_packet(&mut tx_frame, seq, packet_size);
+            let send_time = Instant::now();
 
-        if let Err(e) = radio_client.transmit(cfg.iperf.module, &tx_frame).await {
-            error!("Transmit error: {:?}", e);
+            match radio_client.transmit(cfg.iperf.module, &tx_frame).await {
+                Ok(_) => in_flight.push_back((seq, send_time)),
+                Err(e) => {
+                    error!("Transmit error: {:?}", e);
+                    tx_errors += 1;
+                }
+            }
+
             seq = seq.wrapping_add(1);
-            continue;
         }
 
-        // Wait for the echo of this seq until the deadline. Frames that are not
-        // that echo (other module, late echoes of earlier seqs, non-iperf
-        // traffic) are skipped without re-sending or restarting the timer.
-        let deadline = send_time + Duration::from_millis(RESPONSE_TIMEOUT_MS);
-        let mut channel_closed = false;
+        // Test over and every packet accounted for
+        let Some(&(_, oldest_send_time)) = in_flight.front() else {
+            break;
+        };
+        let deadline = oldest_send_time + response_timeout;
 
-        loop {
-            match timeout_at(deadline.into(), module_rx.recv()).await {
-                Ok(Ok(rx_module)) => {
-                    if rx_module.module != cfg.iperf.module {
-                        continue;
-                    }
+        match timeout_at(deadline.into(), module_rx.recv()).await {
+            Ok(Ok(rx_module)) => {
+                if rx_module.module != cfg.iperf.module {
+                    continue;
+                }
 
-                    let rtt = send_time.elapsed().as_millis() as u64;
-                    let rx_data = rx_module.frame.as_slice();
+                let rx_data = rx_module.frame.as_slice();
 
-                    match parse_packet(rx_data) {
-                        Ok((resp_seq, _)) if resp_seq == seq => {
+                match parse_packet(rx_data) {
+                    Ok((resp_seq, _)) => {
+                        // Echoes of packets no longer in flight (already timed
+                        // out, or duplicates) are ignored
+                        if let Some(pos) = in_flight.iter().position(|&(s, _)| s == resp_seq) {
+                            let (_, send_time) = in_flight.remove(pos).unwrap();
+                            let rtt = send_time.elapsed().as_millis() as u64;
+
                             rtt_min = rtt_min.min(rtt);
                             rtt_max = rtt_max.max(rtt);
                             rtt_sum += rtt;
                             rtt_count += 1;
                             bytes_transferred += (packet_size * 2) as u64; // req + resp
 
-                            println!("seq={:<6} rtt={:<4} ms  size={}", seq, rtt, rx_data.len());
-                            break;
+                            println!(
+                                "seq={:<6} rtt={:<4} ms  size={}",
+                                resp_seq,
+                                rtt,
+                                rx_data.len()
+                            );
                         }
-                        Ok(_) => {
-                            // Late echo of an earlier seq; keep waiting for ours
-                        }
-                        Err(ParseError::CrcMismatch { expected, actual }) => {
+                    }
+                    Err(ParseError::CrcMismatch { expected, actual }) => {
+                        // The seq in a corrupted packet can't be trusted. Echoes
+                        // come back in order, so charge it to the oldest packet.
+                        if let Some((lost_seq, _)) = in_flight.pop_front() {
                             crc_errors += 1;
                             println!(
                                 "seq={:<6} CRC ERROR (expected={:#010x} actual={:#010x})",
-                                seq, expected, actual
+                                lost_seq, expected, actual
                             );
-                            break;
-                        }
-                        Err(_) => {
-                            // Ignore non-iperf packets
                         }
                     }
-                }
-                Ok(Err(broadcast::error::RecvError::Lagged(skipped))) => {
-                    warn!("receive stream lagged by {} frames", skipped);
-                }
-                Ok(Err(broadcast::error::RecvError::Closed)) => {
-                    timeouts += 1;
-                    channel_closed = true;
-                    break;
-                }
-                Err(_) => {
-                    println!("seq={:<6} TIMEOUT", seq);
-                    timeouts += 1;
-                    break;
+                    Err(_) => {
+                        // Ignore non-iperf packets
+                    }
                 }
             }
-        }
-
-        seq = seq.wrapping_add(1);
-
-        if channel_closed {
-            error!("receive stream closed, stopping test");
-            break;
+            Ok(Err(broadcast::error::RecvError::Lagged(skipped))) => {
+                warn!("receive stream lagged by {} frames", skipped);
+            }
+            Ok(Err(broadcast::error::RecvError::Closed)) => {
+                error!("receive stream closed, stopping test");
+                timeouts += in_flight.len() as u64;
+                in_flight.clear();
+                break;
+            }
+            Err(_) => {
+                // Expire every packet whose deadline has passed
+                let now = Instant::now();
+                while let Some(&(lost_seq, send_time)) = in_flight.front() {
+                    if now < send_time + response_timeout {
+                        break;
+                    }
+                    in_flight.pop_front();
+                    println!("seq={:<6} TIMEOUT", lost_seq);
+                    timeouts += 1;
+                }
+            }
         }
     }
 
@@ -437,6 +464,9 @@ async fn run_client(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
         "Packets:      {} sent, {} received, {} timeouts, {} CRC errors",
         packets_sent, rtt_count, timeouts, crc_errors
     );
+    if tx_errors > 0 {
+        println!("TX errors:    {}", tx_errors);
+    }
 
     if rtt_count > 0 {
         let avg_rtt = rtt_sum as f64 / rtt_count as f64;

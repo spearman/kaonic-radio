@@ -11,6 +11,9 @@ module = 0
 duration = 10
 payload_size = 2047
 timeout = 10
+# Packets in flight in client round-trip mode (1 = stop-and-wait).
+# The radio is half-duplex; keep this small (2-4) or echoes collide with new packets.
+window = 1
 
 # Radio Modules
 [radio-0]
