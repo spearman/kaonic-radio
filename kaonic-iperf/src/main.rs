@@ -137,7 +137,11 @@ fn now_ms() -> u64 {
 }
 
 fn fill_packet(frame: &mut Frame<2048>, seq: u32, size: usize) {
-    let size = size.clamp(MIN_PACKET_SIZE, MAX_PACKET_SIZE);
+    // main() validates payload_size; a size outside this range is a bug
+    assert!(
+        (MIN_PACKET_SIZE..=MAX_PACKET_SIZE).contains(&size),
+        "packet size {size} out of range"
+    );
     frame.clear();
 
     let buffer = frame.alloc_buffer(size).expect("Frame too small");
@@ -546,10 +550,8 @@ async fn run_client(
     cfg: &config::Config,
     opts: &Options,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let packet_size = cfg
-        .iperf
-        .payload_size
-        .clamp(MIN_PACKET_SIZE, MAX_PACKET_SIZE);
+    // Already limited to MIN_PACKET_SIZE..=MAX_PACKET_SIZE by main()
+    let packet_size = cfg.iperf.payload_size;
 
     println!("=== Kaonic RTT Client ===");
     println!("Connecting to {}...", address);
@@ -833,6 +835,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(size) = args.payload_size {
         cfg.iperf.payload_size = size;
+    }
+
+    // The client sends packets of payload_size bytes; say so when that size
+    // can't be used as given
+    if args.client {
+        let size = cfg.iperf.payload_size;
+        let clamped = size.clamp(MIN_PACKET_SIZE, MAX_PACKET_SIZE);
+        if size < MIN_PACKET_SIZE {
+            eprintln!(
+                "Warning: payload_size {} is below the minimum packet size of {} bytes \
+                 (magic, sequence number, timestamp, padding and CRC); using {}",
+                size, MIN_PACKET_SIZE, clamped
+            );
+        } else if size > MAX_PACKET_SIZE {
+            eprintln!(
+                "Warning: payload_size {} is above the maximum of {} bytes; using {}",
+                size, MAX_PACKET_SIZE, clamped
+            );
+        }
+        cfg.iperf.payload_size = clamped;
     }
     if let Some(spec) = &args.modulation {
         match cfg.override_modulation(spec) {
