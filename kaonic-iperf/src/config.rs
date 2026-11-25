@@ -244,3 +244,112 @@ fn parse_modulation(presets: &HashMap<String, toml::Value>, name: &str) -> Optio
         _ => None,
     }
 }
+
+/// Parses a modulation spec from the command line:
+/// - `ofdm:<mcs>:<opt>`: MCS 0-6, bandwidth option 1-4 (datasheet numbering,
+///   so option 1 is the widest). Option 3 needs MCS >= 1 and option 4 MCS >= 2.
+/// - `qpsk:<kchip>:<mode>`: chip rate 100/200/1000/2000 kchip/s, rate mode
+///   0-4. Rate mode 4 exists only at 2000 kchip/s.
+pub fn parse_modulation_spec(spec: &str, tx_power: u8) -> Result<Modulation, String> {
+    let bad = || {
+        format!(
+            "bad modulation {spec:?}: expected ofdm:<mcs 0-6>:<opt 1-4> or qpsk:<kchip>:<mode 0-4>"
+        )
+    };
+    let parts: Vec<&str> = spec.split(':').collect();
+    let [kind, a, b] = parts[..] else {
+        return Err(bad());
+    };
+    let a: u32 = a.parse().map_err(|_| bad())?;
+    let b: u32 = b.parse().map_err(|_| bad())?;
+
+    match kind {
+        "ofdm" => {
+            let (mcs, opt) = (a, b);
+            let min_mcs = match opt {
+                1 | 2 => 0,
+                3 => 1,
+                4 => 2,
+                _ => return Err(format!("bad modulation {spec:?}: OFDM option must be 1-4")),
+            };
+            if !(min_mcs..=6).contains(&mcs) {
+                return Err(format!(
+                    "bad modulation {spec:?}: OFDM option {opt} needs MCS {min_mcs}-6"
+                ));
+            }
+            let mcs = match mcs {
+                0 => OfdmMcs::BpskC1_2_4x,
+                1 => OfdmMcs::BpskC1_2_2x,
+                2 => OfdmMcs::QpskC1_2_2x,
+                3 => OfdmMcs::QpskC1_2,
+                4 => OfdmMcs::QpskC3_4,
+                5 => OfdmMcs::QamC1_2,
+                _ => OfdmMcs::QamC3_4,
+            };
+            let opt = match opt {
+                1 => OfdmBandwidthOption::Option1,
+                2 => OfdmBandwidthOption::Option2,
+                3 => OfdmBandwidthOption::Option3,
+                _ => OfdmBandwidthOption::Option4,
+            };
+            Ok(Modulation::Ofdm(OfdmModulation { mcs, opt, tx_power }))
+        }
+        "qpsk" => {
+            let (kchip, mode) = (a, b);
+            let fchip = match kchip {
+                100 => QpskChipFrequency::Fchip100,
+                200 => QpskChipFrequency::Fchip200,
+                1000 => QpskChipFrequency::Fchip1000,
+                2000 => QpskChipFrequency::Fchip2000,
+                _ => {
+                    return Err(format!(
+                        "bad modulation {spec:?}: QPSK chip rate must be 100, 200, 1000 or 2000"
+                    ))
+                }
+            };
+            let mode = match mode {
+                0 => QpskRateMode::RateMode0,
+                1 => QpskRateMode::RateMode1,
+                2 => QpskRateMode::RateMode2,
+                3 => QpskRateMode::RateMode3,
+                4 if kchip == 2000 => QpskRateMode::RateMode4,
+                4 => {
+                    return Err(format!(
+                        "bad modulation {spec:?}: QPSK rate mode 4 needs 2000 kchip/s"
+                    ))
+                }
+                _ => {
+                    return Err(format!(
+                        "bad modulation {spec:?}: QPSK rate mode must be 0-4"
+                    ))
+                }
+            };
+            Ok(Modulation::Qpsk(QpskModulation {
+                fchip,
+                mode,
+                tx_power,
+            }))
+        }
+        _ => Err(bad()),
+    }
+}
+
+impl Config {
+    /// Replaces the iperf module's modulation with `spec` (see
+    /// [`parse_modulation_spec`]). TX power is kept from the module's preset,
+    /// or 10 (the preset default) if it has none.
+    pub fn override_modulation(&mut self, spec: &str) -> Result<Modulation, String> {
+        let module = self.iperf.module;
+        let radio = self
+            .radios
+            .iter_mut()
+            .find(|r| r.module == module)
+            .ok_or_else(|| {
+                format!("no [radio-*] section for iperf module {module} in the config")
+            })?;
+        let tx_power = radio.modulation.map(|m| m.tx_power()).unwrap_or(10);
+        let modulation = parse_modulation_spec(spec, tx_power)?;
+        radio.modulation = Some(modulation);
+        Ok(modulation)
+    }
+}

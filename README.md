@@ -127,6 +127,7 @@ Network performance measurement tool (similar to iperf).
 - Supports both radio modules
 - CRC32 packet validation
 - Command-line interface
+- `tx_only` throughput sweep over OFDM/QPSK settings: `kaonic-iperf/tools/bench-throughput.py --help`
 
 #### **kaonic-test**
 Test utilities and validation tools for the radio stack.

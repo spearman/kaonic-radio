@@ -2,3 +2,5 @@ target
 deploy
 
 .vscode/*
+
+__pycache__/

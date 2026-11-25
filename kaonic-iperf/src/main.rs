@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use kaonic_ctrl::{client::Client, protocol::MessageCoder, radio::RadioClient};
 use kaonic_frame::frame::Frame;
+use radio_common::Modulation;
 
 mod config;
 
@@ -33,6 +34,82 @@ struct Args {
     /// Run as client (initiator)
     #[arg(long, conflicts_with = "server")]
     client: bool,
+
+    /// Modulation for the iperf module, overriding the config's preset:
+    /// ofdm:<mcs 0-6>:<opt 1-4> or qpsk:<kchip 100|200|1000|2000>:<mode 0-4>
+    #[arg(long)]
+    modulation: Option<String>,
+
+    /// One-way test (overrides [iperf] tx_only)
+    #[arg(long)]
+    tx_only: bool,
+
+    /// Test duration in seconds (overrides [iperf] duration)
+    #[arg(long)]
+    duration: Option<u64>,
+
+    /// Packet size in bytes (overrides [iperf] payload_size)
+    #[arg(long)]
+    payload_size: Option<usize>,
+
+    /// Server: exit after this many seconds without an iperf packet
+    #[arg(long, value_name = "SECS")]
+    idle_exit: Option<f64>,
+
+    /// Server with --idle-exit: how long to wait for the first packet,
+    /// counted from when the radio is configured (default: the idle time)
+    #[arg(long, value_name = "SECS", requires = "idle_exit")]
+    first_packet_timeout: Option<f64>,
+
+    /// Print a final machine-readable `RESULT {json}` line
+    #[arg(long)]
+    json: bool,
+}
+
+/// Run options that only come from the command line.
+struct Options {
+    idle_exit: Option<Duration>,
+    first_packet_timeout: Option<Duration>,
+    json: bool,
+}
+
+/// A positive number of seconds from the command line, or exit with an error.
+fn secs_arg(name: &str, secs: Option<f64>) -> Option<Duration> {
+    match secs {
+        Some(s) if s.is_finite() && s > 0.0 => Some(Duration::from_secs_f64(s)),
+        Some(_) => {
+            eprintln!("Error: {} must be a positive number of seconds", name);
+            std::process::exit(2);
+        }
+        None => None,
+    }
+}
+
+/// Sets the module's modulation and reads it back. commd replies OK even
+/// when the radio rejects a modulation, but only reports one it applied.
+async fn apply_modulation(
+    radio_client: &mut RadioClient,
+    module: usize,
+    modulation: Modulation,
+) -> Result<(), String> {
+    radio_client
+        .set_modulation(module, modulation)
+        .await
+        .map_err(|e| format!("Modulation error: {:?}", e))?;
+
+    let applied = radio_client
+        .get_modulation(module)
+        .await
+        .map_err(|e| format!("Modulation readback error: {:?}", e))?;
+
+    if format!("{:?}", applied) != format!("{:?}", modulation) {
+        return Err(format!(
+            "the board did not apply modulation {:?} (it reports {:?})",
+            modulation, applied
+        ));
+    }
+
+    Ok(())
 }
 
 // Packet structure:
@@ -129,7 +206,11 @@ fn parse_packet(data: &[u8]) -> Result<(u32, u64), ParseError> {
     Ok((seq, timestamp))
 }
 
-async fn run_server(address: &str, cfg: &config::Config) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_server(
+    address: &str,
+    cfg: &config::Config,
+    opts: &Options,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Kaonic RTT Server ===");
     println!("Connecting to {}...", address);
 
@@ -161,10 +242,7 @@ async fn run_server(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
             .map_err(|e| format!("Config error: {:?}", e))?;
 
         if let Some(modulation) = radio_cfg.modulation {
-            radio_client
-                .set_modulation(cfg.iperf.module, modulation)
-                .await
-                .map_err(|e| format!("Modulation error: {:?}", e))?;
+            apply_modulation(&mut radio_client, cfg.iperf.module, modulation).await?;
             println!("Modulation configured: {:?}", modulation);
         }
 
@@ -195,13 +273,33 @@ async fn run_server(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
         println!("Mode: one-way (tx_only), not echoing\n");
     }
 
+    // With --idle-exit, stop once no iperf packet has arrived for that long.
+    // Before the first packet, wait --first-packet-timeout instead (the
+    // client may take a while to start).
+    let mut idle_deadline = opts
+        .idle_exit
+        .map(|idle| tokio::time::Instant::now() + opts.first_packet_timeout.unwrap_or(idle));
+
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
+
+    println!("Listening...");
 
     loop {
         tokio::select! {
             _ = &mut shutdown => {
                 println!("\nShutting down...");
+                break;
+            }
+            _ = async { tokio::time::sleep_until(idle_deadline.unwrap()).await }, if idle_deadline.is_some() => {
+                if start_time.is_some() {
+                    println!(
+                        "\nNo iperf packets for {:.1} s, stopping",
+                        opts.idle_exit.unwrap_or_default().as_secs_f64()
+                    );
+                } else {
+                    println!("\nNo iperf packet arrived, stopping");
+                }
                 break;
             }
             result = module_rx.recv() => {
@@ -225,6 +323,9 @@ async fn run_server(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
                                     start_time = Some(now);
                                 }
                                 last_rx_time = Some(now);
+                                if let Some(idle) = opts.idle_exit {
+                                    idle_deadline = Some(tokio::time::Instant::now() + idle);
+                                }
                                 bytes_received += packet_size;
                                 rx_packets += 1;
 
@@ -328,6 +429,29 @@ async fn run_server(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
             );
         }
     }
+
+    if opts.json {
+        let span_s = match (start_time, last_rx_time) {
+            (Some(start), Some(last)) => last.duration_since(start).as_secs_f64(),
+            _ => 0.0,
+        };
+        let result = serde_json::json!({
+            "role": "server",
+            "tx_only": tx_only,
+            "received": if tx_only { seen_seqs.len() as u64 } else { rx_packets },
+            "rx_packets": rx_packets,
+            "echoed": if tx_only { None } else { Some(count) },
+            "duplicates": duplicates,
+            "max_seq": max_seq,
+            "crc_errors": crc_errors,
+            "ignored": ignored,
+            "bytes": bytes_received,
+            "span_s": span_s,
+            "rx_kbps": per_sec(bytes_received * 8, span_s) / 1000.0,
+            "rx_pkt_rate": per_sec(rx_packets, span_s),
+        });
+        println!("RESULT {}", result);
+    }
     Ok(())
 }
 
@@ -337,6 +461,7 @@ async fn run_client_tx_only(
     radio_client: &mut RadioClient,
     cfg: &config::Config,
     packet_size: usize,
+    opts: &Options,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
     let test_duration = Duration::from_secs(cfg.iperf.duration);
@@ -398,10 +523,29 @@ async fn run_client_tx_only(
     println!("Offered:      {:.2} kb/s", offered_kbps(sent, elapsed));
     println!("Packet rate:  {:.1} pkt/s", per_sec(sent, elapsed));
 
+    if opts.json {
+        let result = serde_json::json!({
+            "role": "client",
+            "tx_only": true,
+            "packet_size": packet_size,
+            "sent": sent,
+            "tx_errors": tx_errors,
+            "last_seq": seq.checked_sub(1),
+            "elapsed_s": elapsed,
+            "offered_kbps": offered_kbps(sent, elapsed),
+            "pkt_rate": per_sec(sent, elapsed),
+        });
+        println!("RESULT {}", result);
+    }
+
     Ok(())
 }
 
-async fn run_client(address: &str, cfg: &config::Config) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_client(
+    address: &str,
+    cfg: &config::Config,
+    opts: &Options,
+) -> Result<(), Box<dyn std::error::Error>> {
     let packet_size = cfg
         .iperf
         .payload_size
@@ -438,10 +582,7 @@ async fn run_client(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
             .map_err(|e| format!("Config error: {:?}", e))?;
 
         if let Some(modulation) = radio_cfg.modulation {
-            radio_client
-                .set_modulation(cfg.iperf.module, modulation)
-                .await
-                .map_err(|e| format!("Modulation error: {:?}", e))?;
+            apply_modulation(&mut radio_client, cfg.iperf.module, modulation).await?;
             println!("Modulation configured: {:?}", modulation);
         }
 
@@ -458,7 +599,7 @@ async fn run_client(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
         println!("Packet size: {} bytes", packet_size);
         println!("Duration: {} seconds\n", cfg.iperf.duration);
 
-        let result = run_client_tx_only(&mut radio_client, cfg, packet_size).await;
+        let result = run_client_tx_only(&mut radio_client, cfg, packet_size, opts).await;
         radio_client.cancel();
         return result;
     }
@@ -629,6 +770,27 @@ async fn run_client(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
         println!("Packet loss:  {:.1}%", loss);
     }
 
+    if opts.json {
+        let result = serde_json::json!({
+            "role": "client",
+            "tx_only": false,
+            "packet_size": packet_size,
+            "window": window,
+            "sent": packets_sent,
+            "received": rtt_count,
+            "timeouts": timeouts,
+            "crc_errors": crc_errors,
+            "tx_errors": tx_errors,
+            "rtt_min_ms": (rtt_count > 0).then_some(rtt_min),
+            "rtt_avg_ms": (rtt_count > 0).then(|| rtt_sum as f64 / rtt_count as f64),
+            "rtt_max_ms": (rtt_count > 0).then_some(rtt_max),
+            "elapsed_s": elapsed,
+            "speed_kbps": per_sec(bytes_transferred * 8, elapsed) / 1000.0,
+            "round_trip_rate": per_sec(rtt_count, elapsed),
+        });
+        println!("RESULT {}", result);
+    }
+
     Ok(())
 }
 
@@ -642,7 +804,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     // Load config from specified path (required)
-    let cfg = match config::load_config(&args.config) {
+    let mut cfg = match config::load_config(&args.config) {
         Ok(c) => {
             println!(
                 "Loaded config from {} with {} radio(s)",
@@ -662,6 +824,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
+    // Command-line overrides of the [iperf] section
+    if args.tx_only {
+        cfg.iperf.tx_only = true;
+    }
+    if let Some(duration) = args.duration {
+        cfg.iperf.duration = duration;
+    }
+    if let Some(size) = args.payload_size {
+        cfg.iperf.payload_size = size;
+    }
+    if let Some(spec) = &args.modulation {
+        match cfg.override_modulation(spec) {
+            Ok(modulation) => println!("Modulation from command line: {:?}", modulation),
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(2);
+            }
+        }
+    }
+
+    let opts = Options {
+        idle_exit: secs_arg("--idle-exit", args.idle_exit),
+        first_packet_timeout: secs_arg("--first-packet-timeout", args.first_packet_timeout),
+        json: args.json,
+    };
+
     // Determine address: CLI arg takes precedence over config
     let address = if let Some(addr) = &args.address {
         // Parse as IP:PORT or add default port
@@ -677,9 +865,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if args.server {
-        run_server(&address, &cfg).await?;
+        run_server(&address, &cfg, &opts).await?;
     } else {
-        run_client(&address, &cfg).await?;
+        run_client(&address, &cfg, &opts).await?;
     }
 
     Ok(())
