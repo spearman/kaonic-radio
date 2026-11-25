@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
-"""tx_only throughput sweep for kaonic-iperf: every OFDM / QPSK setting.
+"""Throughput sweep for kaonic-iperf: every OFDM / QPSK setting.
 
-For each modulation setting, the receiving side runs `kaonic-iperf --server
---tx-only` and the sending side `kaonic-iperf --client --tx-only`, both with
-the same `--modulation`. The sender streams packets back to back, the receiver
-counts them, and the receiver's measured rate is the result. Each side runs on
-the machine named by its endpoint, so one copy of this script, normally on a
-dev machine, drives both boards:
+Two tests (`--mode`), each run once per modulation setting with the same
+`--modulation` on both sides:
+- tx_only (default): the receiving side runs `kaonic-iperf --server --tx-only`
+  and the sending side `kaonic-iperf --client --tx-only`. The sender streams
+  packets back to back, the receiver counts them, and the receiver's measured
+  rate is the result.
+- round-trip: the receiving side echoes every packet (`--server`) and the
+  sending side (`--client`) sends the next packet once the echo is back, or
+  keeps `--window` packets in flight. The sender measures the round trips.
+  `--mode both` runs each setting both ways.
+
+Each side runs on the machine named by its endpoint, so one copy of this
+script, normally on a dev machine, drives both boards:
 
     R="ssh -J me@jump root@board-b"
     python3 bench-throughput.py --tx-iperf ./kaonic-iperf --tx-addr 10.78.137.1 \\
@@ -16,6 +23,8 @@ dev machine, drives both boards:
     python3 bench-throughput.py ... --phys qpsk            # only QPSK
     python3 bench-throughput.py ... --phys ofdm:6:1,qpsk:2000:4
     python3 bench-throughput.py ... --quick
+    python3 bench-throughput.py ... --mode round-trip      # echoed, stop-and-wait
+    python3 bench-throughput.py ... --mode both --quick
     python3 bench-throughput.py --dry-run                  # list settings and timing
 
 An endpoint (`--tx`, `--rx`) is a command prefix that kaonic-iperf runs under:
@@ -33,17 +42,22 @@ modulation preset in them is replaced by each setting under test, keeping
 its TX power.
 
 Run length: each setting runs for `--secs`, or longer for slow settings, so
-that at least `--min-packets` packets fit (a 2 KB packet takes seconds at the
-slowest QPSK settings). The receiver stops after a few packet times without
-packets. Both come from a rough airtime model; `--dry-run` shows them.
+that at least `--min-packets` packets (round-trip: round trips) fit; a 2 KB
+packet takes seconds at the slowest QPSK settings. The receiver stops after a
+few packet times without packets. In round-trip mode, the sender's wait for
+each echo (`--response-timeout-ms`) is set per setting to twice the expected
+round trip (times the window), at least 200 ms, and the receiver waits that
+much longer before stopping, since a lost packet holds the sender up for a
+whole timeout. All of these come from a rough airtime model; `--dry-run`
+shows them.
 
 Settings the board rejects (kaonic-iperf reads the modulation back) show as
 `error`. On a sub-GHz module, wide OFDM options may not fit the band plan.
 
-Results go to `<out>/results.csv` and `<out>/results.json`, logs of every run
-to `<out>/logs/`, and a table of the settings, best received throughput first,
-is printed at the end. Exits 0 if every setting ran (whatever its throughput),
-1 if any errored, 2 on bad arguments.
+Results go to `<out>/results.csv` and `<out>/results.json` (a `mode` column
+tells the tests apart), logs of every run to `<out>/logs/`, and a table per
+test of the settings, best throughput first, is printed at the end. Exits 0 if
+every setting ran (whatever its throughput), 1 if any errored, 2 on bad arguments.
 """
 
 import argparse
@@ -81,6 +95,12 @@ QUICK_PHYS = ["ofdm:6:1", "ofdm:3:1", "ofdm:6:4", "qpsk:2000:4", "qpsk:1000:2", 
 STARTUP_S = 30
 SLACK_S = 30
 READY_LINE = "Listening..."
+
+TX_ONLY, ROUND_TRIP = "tx-only", "round-trip"
+# Round-trip mode: the receive-to-send delay at each end (commd, the control
+# link and kaonic-iperf), added to the airtimes for the expected round trip.
+TURNAROUND_S = 0.04
+MIN_RESPONSE_TIMEOUT_MS = 200
 
 
 class Phy:
@@ -135,12 +155,29 @@ def default_phys(kinds):
     return phys
 
 
-def run_length(phy, args):
-    """(test duration, receiver idle time, first-packet wait), seconds."""
-    airtime = phy.airtime_s(args.size)
-    duration = max(args.secs, math.ceil(args.min_packets * airtime))
-    idle = max(2.0, 3 * airtime + 1)
-    return duration, idle, STARTUP_S + idle
+class Timing:
+    """How long one run takes and waits, from the airtime model."""
+
+    def __init__(self, phy, mode, args):
+        airtime = phy.airtime_s(args.size)
+        # The receiver stops this long after its last packet...
+        idle = max(2.0, 3 * airtime + 1)
+        self.response_timeout_ms = None
+        if mode == TX_ONLY:
+            per_packet = airtime
+        else:
+            per_packet = 2 * airtime + TURNAROUND_S
+            self.response_timeout_ms = max(
+                MIN_RESPONSE_TIMEOUT_MS, math.ceil((2 * per_packet * args.window + 0.1) * 1000)
+            )
+            # ...but a lost packet leaves it waiting a whole response timeout.
+            idle += self.response_timeout_ms / 1000
+        self.duration = max(args.secs, math.ceil(args.min_packets * per_packet))
+        self.idle = idle
+        self.first_wait = STARTUP_S + idle
+
+    def estimate_s(self):
+        return self.duration + self.idle + 5
 
 
 # --- endpoints -----------------------------------------------------------------
@@ -246,22 +283,77 @@ class Proc:
 # --- one setting ---------------------------------------------------------------
 
 
-def run_setting(phy, args, tx, rx, log_dir):
-    duration, idle, first_wait = run_length(phy, args)
+def tx_only_fields(t, r):
+    """Row fields of a tx_only run: the receiver's measurement, loss against
+    what the sender's radio took. Returns (fields, sent, received, nothing_sent)."""
+    sent, received = t["sent"], r["received"]
+    loss = max(0, sent - received) / sent * 100 if sent else None
+    fields = {
+        "rx_kbps": round(r["rx_kbps"], 2),
+        "loss_pct": None if loss is None else round(loss, 2),
+        "rx_pkt_rate": round(r["rx_pkt_rate"], 2),
+        "sent": sent,
+        "received": received,
+        "tx_errors": t["tx_errors"],
+        "crc_errors": r["crc_errors"],
+        "duplicates": r["duplicates"],
+        "offered_kbps": round(t["offered_kbps"], 2),
+        "offered_pkt_rate": round(t["pkt_rate"], 2),
+        "rx_span_s": round(r["span_s"], 3),
+    }
+    return fields, loss, received, sent == 0 and t["tx_errors"] > 0
+
+
+def round_trip_fields(t, r):
+    """Row fields of a round-trip run: the sender's measurement. Its `sent`
+    counts every packet, including ones its radio refused."""
+    sent, received = t["sent"], t["received"]
+    loss = max(0, sent - received) / sent * 100 if sent else None
+    rnd = lambda v, n=2: None if v is None else round(v, n)
+    fields = {
+        "speed_kbps": round(t["speed_kbps"], 2),
+        "loss_pct": rnd(loss),
+        "rt_rate": round(t["round_trip_rate"], 2),
+        "rtt_avg_ms": rnd(t["rtt_avg_ms"], 1),
+        "rtt_max_ms": t["rtt_max_ms"],
+        "sent": sent,
+        "received": received,
+        "timeouts": t["timeouts"],
+        "crc_errors": t["crc_errors"],
+        "tx_errors": t["tx_errors"],
+        "window": t["window"],
+        "echoed": r.get("echoed"),
+    }
+    return fields, loss, received, sent > 0 and t["tx_errors"] >= sent
+
+
+def run_setting(phy, mode, args, tx, rx, log_dir):
+    timing = Timing(phy, mode, args)
     row = {
+        "mode": mode,
         "setting": str(phy),
         "spec": phy.spec(),
         "status": "error",
         "nominal_kbps": round(phy.kbps(), 2),
         "airtime_ms": round(phy.airtime_s(args.size) * 1000, 2),
-        "duration_s": duration,
+        "duration_s": timing.duration,
         "size": args.size,
     }
-    name = phy.spec().replace(":", "-")
-    common = ["--tx-only", "--modulation", phy.spec(), "--json"]
+    name = phy.spec().replace(":", "-") + ("-txonly" if mode == TX_ONLY else "-roundtrip")
+    common = ["--modulation", phy.spec(), "--json"]
+    client = ["--duration", str(timing.duration), "--payload-size", str(args.size)]
+    # Always name the mode: kaonic-iperf otherwise takes it from [iperf] tx_only
+    # in that side's config.
+    if mode == TX_ONLY:
+        common.append("--tx-only")
+    else:
+        common.append("--round-trip")
+        row["response_timeout_ms"] = timing.response_timeout_ms
+        client += ["--window", str(args.window), "--response-timeout-ms", str(timing.response_timeout_ms)]
 
     receiver = Proc(
-        rx.argv(["--server"] + common + ["--idle-exit", f"{idle:.1f}", "--first-packet-timeout", f"{first_wait:.1f}"]),
+        rx.argv(["--server"] + common
+                + ["--idle-exit", f"{timing.idle:.1f}", "--first-packet-timeout", f"{timing.first_wait:.1f}"]),
         os.path.join(log_dir, f"{name}-rx.log"),
     )
     sender = None
@@ -270,15 +362,14 @@ def run_setting(phy, args, tx, rx, log_dir):
             row["error"] = f"receiver didn't start: {receiver.why()}"
             return row
 
-        sender = Proc(
-            tx.argv(["--client"] + common + ["--duration", str(duration), "--payload-size", str(args.size)]),
-            os.path.join(log_dir, f"{name}-tx.log"),
-        )
-        if sender.wait(duration + STARTUP_S + SLACK_S) is None:
+        sender = Proc(tx.argv(["--client"] + common + client), os.path.join(log_dir, f"{name}-tx.log"))
+        # Round-trip senders drain their last packets, up to one response timeout.
+        drain = (timing.response_timeout_ms or 0) / 1000
+        if sender.wait(timing.duration + drain + STARTUP_S + SLACK_S) is None:
             row["error"] = "sender didn't finish"
             return row
         # The receiver stops by itself once packets stop arriving.
-        if receiver.wait(first_wait + SLACK_S) is None:
+        if receiver.wait(timing.first_wait + SLACK_S) is None:
             row["error"] = "receiver didn't stop"
             return row
 
@@ -290,22 +381,23 @@ def run_setting(phy, args, tx, rx, log_dir):
             row["error"] = f"receiver: {receiver.why()}"
             return row
 
-        sent, received = t["sent"], r["received"]
-        loss = max(0, sent - received) / sent * 100 if sent else None
-        row.update({
-            "rx_kbps": round(r["rx_kbps"], 2),
-            "loss_pct": None if loss is None else round(loss, 2),
-            "rx_pkt_rate": round(r["rx_pkt_rate"], 2),
-            "sent": sent,
-            "received": received,
-            "tx_errors": t["tx_errors"],
-            "crc_errors": r["crc_errors"],
-            "duplicates": r["duplicates"],
-            "offered_kbps": round(t["offered_kbps"], 2),
-            "offered_pkt_rate": round(t["pkt_rate"], 2),
-            "rx_span_s": round(r["span_s"], 3),
-        })
-        if received == 0:
+        want = mode == TX_ONLY
+        for side, result in (("sender", t), ("receiver", r)):
+            if result.get("tx_only") is not want:
+                row["error"] = (f"{side} ran tx_only={result.get('tx_only')}, expected {want} "
+                                "(is that side's kaonic-iperf older than this script?)")
+                return row
+
+        fields = tx_only_fields if mode == TX_ONLY else round_trip_fields
+        try:
+            values, loss, received, nothing_sent = fields(t, r)
+        except (KeyError, TypeError) as e:
+            row["error"] = f"unexpected RESULT ({type(e).__name__}: {e}); see the logs"
+            return row
+        row.update(values)
+        if nothing_sent:
+            row["status"] = "no tx"
+        elif received == 0:
             row["status"] = "no rx"
         elif loss is not None and loss > args.lossy_pct:
             row["status"] = "lossy"
@@ -322,28 +414,61 @@ def run_setting(phy, args, tx, rx, log_dir):
 # --- output --------------------------------------------------------------------
 
 
-def table(rows):
-    """One row per setting, best received throughput first; settings with
-    nothing measured at the bottom, in run order."""
-    head = ["setting", "status", "nominal", "rx_kbps", "loss", "pkt/s", "sent", "received", "tx_err", "crc",
-            "offered"]
+def num(r, key, fmt="{:.1f}"):
+    v = r.get(key)
+    return "" if v is None else fmt.format(v)
+
+
+def tx_only_cells(r, has):
+    return [
+        r["setting"],
+        r["status"],
+        f"{r['nominal_kbps']:.1f}",
+        num(r, "rx_kbps") if has else "",
+        num(r, "loss_pct", "{:.1f}%"),
+        num(r, "rx_pkt_rate") if has else "",
+        str(r.get("sent", "")),
+        str(r.get("received", "")),
+        str(r.get("tx_errors", "")),
+        str(r.get("crc_errors", "")),
+        num(r, "offered_kbps"),
+    ]
+
+
+def round_trip_cells(r, has):
+    return [
+        r["setting"],
+        r["status"],
+        f"{r['nominal_kbps']:.1f}",
+        num(r, "speed_kbps") if has else "",
+        num(r, "loss_pct", "{:.1f}%"),
+        num(r, "rt_rate") if has else "",
+        num(r, "rtt_avg_ms") if has else "",
+        num(r, "rtt_max_ms", "{}") if has else "",
+        str(r.get("sent", "")),
+        str(r.get("received", "")),
+        str(r.get("timeouts", "")),
+        str(r.get("crc_errors", "")),
+        str(r.get("tx_errors", "")),
+    ]
+
+
+TABLES = {
+    TX_ONLY: (["setting", "status", "nominal", "rx_kbps", "loss", "pkt/s", "sent", "received", "tx_err", "crc",
+               "offered"], tx_only_cells, "rx_kbps"),
+    ROUND_TRIP: (["setting", "status", "nominal", "speed", "loss", "rt/s", "rtt_avg", "rtt_max", "sent",
+                  "received", "timeouts", "crc", "tx_err"], round_trip_cells, "speed_kbps"),
+}
+
+
+def table(rows, mode):
+    """One row per setting, best throughput first; settings with nothing
+    measured at the bottom, in run order."""
+    head, row_cells, key = TABLES[mode]
     measured, other = [], []
     for r in rows:
         has = r["status"] in ("ok", "lossy")
-        cells = [
-            r["setting"],
-            r["status"],
-            f"{r['nominal_kbps']:.1f}",
-            f"{r['rx_kbps']:.1f}" if has else "",
-            f"{r['loss_pct']:.1f}%" if r.get("loss_pct") is not None else "",
-            f"{r['rx_pkt_rate']:.1f}" if has else "",
-            str(r.get("sent", "")),
-            str(r.get("received", "")),
-            str(r.get("tx_errors", "")),
-            str(r.get("crc_errors", "")),
-            f"{r['offered_kbps']:.1f}" if "offered_kbps" in r else "",
-        ]
-        (measured if has else other).append((r.get("rx_kbps", 0), cells))
+        (measured if has else other).append((r.get(key) or 0, row_cells(r, has)))
     measured.sort(key=lambda x: -x[0])
     cells = [c for _, c in measured] + [c for _, c in other]
     widths = [max(len(x) for x in col) for col in zip(head, *cells)]
@@ -377,6 +502,12 @@ def main():
                         "OFDM is ofdm:<mcs 0-6>:<option 1-4> (default: %(default)s)")
     p.add_argument("--quick", action="store_true",
                    help=f"only a few settings of the kinds in --phys: {', '.join(QUICK_PHYS)}")
+    p.add_argument("--mode", choices=[TX_ONLY, ROUND_TRIP, "both"], default=TX_ONLY,
+                   help="tx-only: stream, the receiver counts; round-trip: the receiver echoes, the sender "
+                        "measures; both: each setting both ways (default: %(default)s)")
+    p.add_argument("--window", type=int, default=1,
+                   help="round-trip: packets in flight; above 1, packets and echoes collide on the one "
+                        "half-duplex channel (default: %(default)s)")
     p.add_argument("--secs", type=int, default=10, help="test time per setting, at least (default: %(default)s)")
     p.add_argument("--min-packets", type=int, default=30,
                    help="lengthen slow settings' runs to fit this many packets (default: %(default)s)")
@@ -407,33 +538,45 @@ def main():
         p.error("--size must be 24-2048")
     if args.secs < 1 or args.min_packets < 1:
         p.error("--secs and --min-packets must be at least 1")
+    if args.window < 1:
+        p.error("--window must be at least 1")
+    modes = [TX_ONLY, ROUND_TRIP] if args.mode == "both" else [args.mode]
+    runs = [(ph, mode) for ph in phys for mode in modes]
 
-    est = sum(d + i + 5 for d, i, _ in (run_length(ph, args) for ph in phys))
+    est = sum(Timing(ph, mode, args).estimate_s() for ph, mode in runs)
     if args.dry_run:
-        print(f"{len(phys)} settings, {args.size}-byte packets, about {est / 60:.0f} min:")
-        for ph in phys:
-            d, i, _ = run_length(ph, args)
-            print(f"  {str(ph):11s} nominal={ph.kbps():7.1f} kbit/s  airtime={ph.airtime_s(args.size) * 1000:8.1f} ms"
-                  f"  run={d:4d} s  idle={i:5.1f} s")
+        window = f", window {args.window}" if ROUND_TRIP in modes else ""
+        print(f"{len(runs)} runs ({len(phys)} settings x {', '.join(modes)}), {args.size}-byte packets{window}, "
+              f"about {est / 60:.0f} min:")
+        for ph, mode in runs:
+            t = Timing(ph, mode, args)
+            timeout = f"  timeout={t.response_timeout_ms:6d} ms" if t.response_timeout_ms else ""
+            print(f"  {str(ph):11s} {mode:10s} nominal={ph.kbps():7.1f} kbit/s"
+                  f"  airtime={ph.airtime_s(args.size) * 1000:8.1f} ms  run={t.duration:4d} s"
+                  f"  idle={t.idle:5.1f} s{timeout}")
         return 0
 
     out_dir = args.out or time.strftime("throughput-%Y%m%d-%H%M%S")
     log_dir = os.path.join(out_dir, "logs")
     os.makedirs(log_dir, exist_ok=True)
 
-    print(f">> {len(phys)} settings, about {est / 60:.0f} min; results in {out_dir}/", flush=True)
+    print(f">> {len(runs)} runs, about {est / 60:.0f} min; results in {out_dir}/", flush=True)
     rows, errors = [], 0
     try:
-        for n, ph in enumerate(phys, 1):
-            d, _, _ = run_length(ph, args)
-            print(f"[{n}/{len(phys)}] {ph} ({d} s)", flush=True)
-            row = run_setting(ph, args, tx, rx, log_dir)
-            if row["status"] == "error":
+        for n, (ph, mode) in enumerate(runs, 1):
+            t = Timing(ph, mode, args)
+            print(f"[{n}/{len(runs)}] {ph} {mode} ({t.duration} s)", flush=True)
+            row = run_setting(ph, mode, args, tx, rx, log_dir)
+            status = row["status"]
+            loss = "" if row.get("loss_pct") is None else f", loss {row['loss_pct']:.1f}%"
+            if status == "error":
                 errors += 1
                 print(f"    error: {row['error']}", flush=True)
+            elif mode == TX_ONLY:
+                print(f"    {status}: {row['rx_kbps']:.1f} kbit/s{loss}, {row['rx_pkt_rate']:.1f} pkt/s", flush=True)
             else:
-                loss = "" if row.get("loss_pct") is None else f", loss {row['loss_pct']:.1f}%"
-                print(f"    {row['status']}: {row['rx_kbps']:.1f} kbit/s{loss}, {row['rx_pkt_rate']:.1f} pkt/s",
+                rtt = "" if row.get("rtt_avg_ms") is None else f", rtt {row['rtt_avg_ms']:.1f} ms"
+                print(f"    {status}: {row['speed_kbps']:.1f} kbit/s{loss}, {row['rt_rate']:.1f} round trips/s{rtt}",
                       flush=True)
             rows.append(row)
             with open(os.path.join(out_dir, "results.json"), "w") as f:
@@ -443,12 +586,25 @@ def main():
 
     if rows:
         write_csv(os.path.join(out_dir, "results.csv"), rows)
-        print(f"\ntx_only, {args.size}-byte packets.")
-        print("nominal = the setting's PHY data rate; rx_kbps and pkt/s = received kbits and packets per second;")
-        print("loss = % packets the sender's radio sent that never arrived;")
-        print("sent/tx_err = packets the sender's radio sent/refused; crc = corrupted packets at the receiver;")
-        print(f"offered = sender's rate; lossy = loss over {args.lossy_pct:g}%. All rates in kbit/s.\n")
-        print(table(rows))
+        tx_only_rows = [r for r in rows if r["mode"] == TX_ONLY]
+        round_trip_rows = [r for r in rows if r["mode"] == ROUND_TRIP]
+        if tx_only_rows:
+            print(f"\ntx_only, {args.size}-byte packets.")
+            print("nominal = the setting's PHY data rate; rx_kbps and pkt/s = received kbits and packets per second;")
+            print("loss = % packets the sender's radio sent that never arrived;")
+            print("sent/tx_err = packets the sender's radio sent/refused; crc = corrupted packets at the receiver;")
+            print(f"offered = sender's rate; lossy = loss over {args.lossy_pct:g}%; no tx = the sender's radio "
+                  "took nothing. All rates in kbit/s.\n")
+            print(table(tx_only_rows, TX_ONLY))
+        if round_trip_rows:
+            print(f"\nround-trip, {args.size}-byte packets, window {args.window}.")
+            print("nominal = the setting's PHY data rate; speed = kbits per second, both directions;")
+            print("rt/s = completed round trips per second; rtt_avg/rtt_max in ms;")
+            print("loss = % packets sent that got no echo back (timeouts + CRC errors + TX errors);")
+            print("tx_err = packets the sender's radio refused; crc = corrupted echoes at the sender;")
+            print(f"lossy = loss over {args.lossy_pct:g}%; no tx = the sender's radio took nothing. "
+                  "All rates in kbit/s.\n")
+            print(table(round_trip_rows, ROUND_TRIP))
         print(f"\n>> {out_dir}/results.csv, {out_dir}/results.json, logs in {log_dir}/")
     return 1 if errors else 0
 

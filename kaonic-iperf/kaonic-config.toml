@@ -12,7 +12,7 @@ duration = 10
 payload_size = 2047
 # Packets in flight in client round-trip mode (1 = stop-and-wait).
 window = 1
-# One-way test (must be set on both sides)
+# tx_only test (must be set on both sides)
 tx_only = false
 # How long to wait for each echo in round-trip test. Should be increased for slower
 # modulations.

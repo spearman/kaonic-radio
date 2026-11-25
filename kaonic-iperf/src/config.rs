@@ -18,7 +18,7 @@ pub struct IperfConfig {
     pub module: usize,
     /// Packets in flight in client round-trip mode (1 = stop-and-wait).
     pub window: usize,
-    /// One-way test: the client streams packets and the server only counts them.
+    /// tx_only test: the client streams packets and the server only counts them.
     pub tx_only: bool,
     /// Round-trip mode: how long to wait for each echo before counting it lost.
     pub response_timeout_ms: u64,

@@ -40,9 +40,21 @@ struct Args {
     #[arg(long)]
     modulation: Option<String>,
 
-    /// One-way test (overrides [iperf] tx_only)
+    /// tx_only test: stream packets without echoes (overrides [iperf] tx_only)
     #[arg(long)]
     tx_only: bool,
+
+    /// Round-trip test: the server echoes every packet (overrides [iperf] tx_only)
+    #[arg(long, conflicts_with = "tx_only")]
+    round_trip: bool,
+
+    /// Round-trip mode: packets in flight (overrides [iperf] window)
+    #[arg(long)]
+    window: Option<usize>,
+
+    /// Round-trip mode: ms to wait for each echo (overrides [iperf] response_timeout_ms)
+    #[arg(long, value_name = "MS")]
+    response_timeout_ms: Option<u64>,
 
     /// Test duration in seconds (overrides [iperf] duration)
     #[arg(long)]
@@ -267,14 +279,14 @@ async fn run_server(
     let mut start_time: Option<Instant> = None;
     let mut last_rx_time: Option<Instant> = None;
 
-    // One-way (tx_only) mode: seqs seen, to count loss and duplicates
+    // tx_only mode: seqs seen, to count loss and duplicates
     let tx_only = cfg.iperf.tx_only;
     let mut seen_seqs: HashSet<u32> = HashSet::new();
     let mut max_seq: Option<u32> = None;
     let mut duplicates: u64 = 0;
 
     if tx_only {
-        println!("Mode: one-way (tx_only), not echoing\n");
+        println!("Mode: tx_only, not echoing\n");
     }
 
     // With --idle-exit, stop once no iperf packet has arrived for that long.
@@ -459,7 +471,7 @@ async fn run_server(
     Ok(())
 }
 
-/// One-way test: send packets back-to-back for the test duration without waiting for
+/// tx_only test: send packets back-to-back for the test duration without waiting for
 /// echoes.
 async fn run_client_tx_only(
     radio_client: &mut RadioClient,
@@ -517,7 +529,7 @@ async fn run_client_tx_only(
 
     let elapsed = start.elapsed().as_secs_f64();
 
-    println!("\n=== Results (one-way) ===");
+    println!("\n=== Results (tx_only) ===");
     println!("Duration:     {:.2} s", elapsed);
     println!("Packet size:  {} bytes", packet_size);
     println!("Packets:      {} sent, {} TX errors", sent, tx_errors);
@@ -597,7 +609,7 @@ async fn run_client(
     }
 
     if cfg.iperf.tx_only {
-        println!("Mode: one-way (tx_only)");
+        println!("Mode: tx_only");
         println!("Packet size: {} bytes", packet_size);
         println!("Duration: {} seconds\n", cfg.iperf.duration);
 
@@ -830,11 +842,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.tx_only {
         cfg.iperf.tx_only = true;
     }
+    if args.round_trip {
+        cfg.iperf.tx_only = false;
+    }
     if let Some(duration) = args.duration {
         cfg.iperf.duration = duration;
     }
     if let Some(size) = args.payload_size {
         cfg.iperf.payload_size = size;
+    }
+    if let Some(window) = args.window {
+        cfg.iperf.window = window.max(1);
+    }
+    if let Some(ms) = args.response_timeout_ms {
+        cfg.iperf.response_timeout_ms = ms.max(1);
     }
 
     // The client sends packets of payload_size bytes; say so when that size
