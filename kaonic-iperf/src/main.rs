@@ -1,6 +1,6 @@
 use clap::Parser;
 use log::{error, warn};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::{sync::broadcast, time::timeout_at};
 use tokio_util::sync::CancellationToken;
@@ -177,6 +177,16 @@ async fn run_server(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
     let mut start_time: Option<Instant> = None;
     let mut last_rx_time: Option<Instant> = None;
 
+    // One-way (tx_only) mode: seqs seen, to count loss and duplicates
+    let tx_only = cfg.iperf.tx_only;
+    let mut seen_seqs: HashSet<u32> = HashSet::new();
+    let mut max_seq: Option<u32> = None;
+    let mut duplicates: u64 = 0;
+
+    if tx_only {
+        println!("Mode: one-way (tx_only), not echoing\n");
+    }
+
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
 
@@ -199,7 +209,9 @@ async fn run_server(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
                             Ok((seq, _ts)) => {
                                 // Track receive stats
                                 let packet_size = rx_data.len() as u64;
-                                println!("[RX] seq={} size={} bytes", seq, packet_size);
+                                if !tx_only {
+                                    println!("[RX] seq={} size={} bytes", seq, packet_size);
+                                }
                                 let now = Instant::now();
                                 if start_time.is_none() {
                                     start_time = Some(now);
@@ -218,6 +230,19 @@ async fn run_server(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
                                         }
                                     })
                                     .unwrap_or(0.0);
+
+                                if tx_only {
+                                    count += 1;
+                                    if !seen_seqs.insert(seq) {
+                                        duplicates += 1;
+                                    }
+                                    max_seq = Some(max_seq.map_or(seq, |m| m.max(seq)));
+                                    println!(
+                                        "[{}] RX seq={} size={}  rx={:.2} kb/s",
+                                        count, seq, rx_data.len(), speed_kbps
+                                    );
+                                    continue;
+                                }
 
                                 // Echo back the same packet
                                 let mut echo_frame = Frame::<2048>::new();
@@ -260,7 +285,27 @@ async fn run_server(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
 
     radio_client.cancel();
 
-    println!("\nTotal packets echoed: {}", count);
+    if !tx_only {
+        println!("\nTotal packets echoed: {}", count);
+    } else if let Some(max_seq) = max_seq {
+        // The client numbers packets from 0, so 0..=max_seq should all have arrived
+        let expected = u64::from(max_seq) + 1;
+        let unique = seen_seqs.len() as u64;
+        let loss = (expected.saturating_sub(unique)) as f64 / expected as f64 * 100.0;
+        println!(
+            "\nPackets received: {} of {} expected (seq 0..={}), loss {:.1}%",
+            unique, expected, max_seq, loss
+        );
+        println!(
+            "  (packets lost after seq {} aren't counted; compare with the client's last seq)",
+            max_seq
+        );
+        if duplicates > 0 {
+            println!("Duplicates: {}", duplicates);
+        }
+    } else {
+        println!("\nNo iperf packets received");
+    }
     if ignored > 0 {
         println!("Ignored (non-iperf): {}", ignored);
     }
@@ -275,6 +320,74 @@ async fn run_server(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
             println!("Avg receive speed: {:.2} kb/s", avg_speed_kbps);
         }
     }
+    Ok(())
+}
+
+/// One-way test: send packets back-to-back for the test duration without waiting for
+/// echoes.
+async fn run_client_tx_only(
+    radio_client: &mut RadioClient,
+    cfg: &config::Config,
+    packet_size: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    let test_duration = Duration::from_secs(cfg.iperf.duration);
+    let progress_interval = Duration::from_secs(1);
+    let mut next_progress = progress_interval;
+
+    let mut seq: u32 = 0;
+    let mut sent: u64 = 0;
+    let mut tx_errors: u64 = 0;
+
+    let mut tx_frame = Frame::<2048>::new();
+
+    let offered_kbps = |sent: u64, elapsed: f64| {
+        if elapsed > 0.0 {
+            (sent * packet_size as u64) as f64 * 8.0 / elapsed / 1000.0
+        } else {
+            0.0
+        }
+    };
+
+    while start.elapsed() < test_duration {
+        fill_packet(&mut tx_frame, seq, packet_size);
+
+        match radio_client.transmit(cfg.iperf.module, &tx_frame).await {
+            Ok(_) => sent += 1,
+            Err(e) => {
+                error!("seq={} transmit error: {:?}", seq, e);
+                tx_errors += 1;
+            }
+        }
+
+        // Seq advances even on error so the server sees the gap
+        seq = seq.wrapping_add(1);
+
+        let elapsed = start.elapsed();
+        if elapsed >= next_progress {
+            let secs = elapsed.as_secs_f64();
+            println!(
+                "[{:>5.1} s] sent={}  tx_errors={}  offered={:.1} kb/s",
+                secs,
+                sent,
+                tx_errors,
+                offered_kbps(sent, secs)
+            );
+            next_progress += progress_interval;
+        }
+    }
+
+    let elapsed = start.elapsed().as_secs_f64();
+
+    println!("\n=== Results (one-way) ===");
+    println!("Duration:     {:.2} s", elapsed);
+    println!("Packet size:  {} bytes", packet_size);
+    println!("Packets:      {} sent, {} TX errors", sent, tx_errors);
+    if seq > 0 {
+        println!("Last seq:     {}", seq - 1);
+    }
+    println!("Offered:      {:.2} kb/s", offered_kbps(sent, elapsed));
+
     Ok(())
 }
 
@@ -328,6 +441,16 @@ async fn run_client(address: &str, cfg: &config::Config) -> Result<(), Box<dyn s
             "Warning: no radio config found for module {}",
             cfg.iperf.module
         );
+    }
+
+    if cfg.iperf.tx_only {
+        println!("Mode: one-way (tx_only)");
+        println!("Packet size: {} bytes", packet_size);
+        println!("Duration: {} seconds\n", cfg.iperf.duration);
+
+        let result = run_client_tx_only(&mut radio_client, cfg, packet_size).await;
+        radio_client.cancel();
+        return result;
     }
 
     let window = cfg.iperf.window.max(1);

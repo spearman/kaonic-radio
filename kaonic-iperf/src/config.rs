@@ -19,6 +19,8 @@ pub struct IperfConfig {
     pub module: usize,
     /// Packets in flight in client round-trip mode (1 = stop-and-wait).
     pub window: usize,
+    /// One-way test: the client streams packets and the server only counts them.
+    pub tx_only: bool,
 }
 
 impl Default for IperfConfig {
@@ -30,6 +32,7 @@ impl Default for IperfConfig {
             ip: None,
             module: 0,
             window: 1,
+            tx_only: false,
         }
     }
 }
@@ -56,6 +59,7 @@ struct IperfPartial {
     ip: Option<String>,
     module: Option<i64>,
     window: Option<usize>,
+    tx_only: Option<bool>,
 }
 
 /// Loads configuration from the given TOML file path and maps radio-* sections to protobufs.
@@ -136,6 +140,9 @@ pub fn load_config(path: &str) -> Result<Config, Box<dyn Error>> {
             }
             if let Some(w) = partial.window {
                 d.window = w.max(1);
+            }
+            if let Some(b) = partial.tx_only {
+                d.tx_only = b;
             }
         }
         d

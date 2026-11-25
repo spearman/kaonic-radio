@@ -14,6 +14,8 @@ timeout = 10
 # Packets in flight in client round-trip mode (1 = stop-and-wait).
 # The radio is half-duplex; keep this small (2-4) or echoes collide with new packets.
 window = 1
+# One-way test: the client streams packets and the server only counts them (set on both sides)
+tx_only = false
 
 # Radio Modules
 [radio-0]
