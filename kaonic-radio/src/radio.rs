@@ -1,6 +1,10 @@
 use radio_common::{Modulation, RadioConfig};
 
+pub use radio_common::Accelerator;
+pub use radio_common::{Antenna, RadioBand};
+
 use crate::error::KaonicError;
+use crate::filter::{BandRanges, FilterState};
 
 /// Result of a successful frame reception.
 pub struct ReceiveResult {
@@ -42,6 +46,36 @@ pub trait Radio {
 
     /// Returns the current modulation scheme.
     fn get_modulation(&self) -> Modulation;
+
+    fn set_accelerator(&mut self, accelerator: &Accelerator) -> Result<(), KaonicError>;
+
+    fn get_accelerator(&self) -> Accelerator;
+
+    /// Selects the antenna (internal or external) used for the given frequency band.
+    fn set_antenna(&mut self, band: RadioBand, antenna: Antenna) -> Result<(), KaonicError>;
+
+    /// Returns the currently selected antenna for the given frequency band.
+    fn get_antenna(&self, band: RadioBand) -> Antenna;
+
+    /// The sub-GHz filters of the front end, which one is asked for and
+    /// which one is in use. Empty on a radio without filter control.
+    fn get_filter(&self) -> FilterState {
+        FilterState::default()
+    }
+
+    /// The frequency ranges the radio's front end is built for, for display:
+    /// a frequency outside is still applied. Empty when not known.
+    fn band_ranges(&self) -> BandRanges {
+        BandRanges::default()
+    }
+
+    /// Selects a sub-GHz filter by its index in `get_filter().filters`, or
+    /// `None` for auto: the narrowest filter that covers the frequency, else
+    /// the wide one. Kept across config changes.
+    fn set_filter(&mut self, filter: Option<u8>) -> Result<(), KaonicError> {
+        let _ = filter;
+        Err(KaonicError::NotSupported)
+    }
 
     /// Transmits a frame over the air.
     fn transmit(&mut self, frame: &Self::TxFrame) -> Result<(), KaonicError>;
