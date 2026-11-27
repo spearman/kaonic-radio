@@ -10,16 +10,20 @@ mkShell {
     openssl
     pkg-config
     protobuf
+    (python3.withPackages (p: with p; [
+      ipython
+      python-lsp-server
+    ]))
     rustup
     rust-analyzer
   ];
   LIBCLANG_PATH="${lib.getLib llvmPackages.libclang}/lib";
   LD_LIBRARY_PATH = lib.makeLibraryPath [
     libglvnd
-    xorg.libX11
-    xorg.libXcursor
-    xorg.libXi
-    xorg.libXrandr
+    libX11
+    libXcursor
+    libXi
+    libXrandr
     libxkbcommon
   ];
 }
